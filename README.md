@@ -500,3 +500,30 @@ The sub-agent status supervision and turn-only interruption features were inspir
 ## License
 
 MIT
+
+## Using alongside pi-subagents (Jacek's)
+
+If your project pins [jjuraszek/pi-subagents](https://github.com/jjuraszek/pi-subagents) as a team contract, you can't install this package normally — both register a tool named `subagent` and pi will error on the collision.
+
+Instead, use the bridge extension in `pi-extension/jacek-bridge.ts`. It intercepts Jacek's `subagent` tool calls and re-dispatches them through this package's cmux machinery — single calls spawn in panes and steer back; chain/parallel calls fall through to Jacek's implementation unchanged.
+
+**Setup:**
+
+1. Do NOT `pi install` this package (skip the normal install step).
+2. Keep pi-subagents installed at project or user scope.
+3. Copy or symlink the bridge into your user extensions:
+   ```bash
+   # Option A: copy
+   cp pi-extension/jacek-bridge.ts ~/.pi/agent/extensions/
+
+   # Option B: symlink from the git checkout pi already pulled
+   ln -s ~/.pi/agent/git/github.com/nertzy/pi-interactive-subagents/pi-extension/jacek-bridge.ts \
+         ~/.pi/agent/extensions/jacek-bridge.ts
+   ```
+4. Set the mux backend in your shell (e.g. `~/.config/fish/conf.d/pi-subagents.fish`):
+   ```fish
+   set -gx PI_SUBAGENT_MUX cmux
+   ```
+5. `/reload` in pi.
+
+Single `subagent(...)` calls will now open a new cmux pane and steer results back asynchronously. The bridge file's imports use `./subagents/...` paths so they resolve correctly from the pi checkout location.
