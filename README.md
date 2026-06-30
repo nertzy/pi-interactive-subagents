@@ -509,21 +509,43 @@ Instead, use the bridge extension in `pi-extension/jacek-bridge.ts`. It intercep
 
 **Setup:**
 
-1. Do NOT `pi install` this package (skip the normal install step).
-2. Keep pi-subagents installed at project or user scope.
-3. Copy or symlink the bridge into your user extensions:
-   ```bash
-   # Option A: copy
-   cp pi-extension/jacek-bridge.ts ~/.pi/agent/extensions/
+The quickest path is the included setup script (run from inside the checkout):
 
-   # Option B: symlink from the git checkout pi already pulled
-   ln -s ~/.pi/agent/git/github.com/nertzy/pi-interactive-subagents/pi-extension/jacek-bridge.ts \
-         ~/.pi/agent/extensions/jacek-bridge.ts
+```bash
+bash pi-extension/setup-bridge.sh
+```
+
+It creates all the necessary symlinks in `~/.pi/agent/extensions/` and is safe to re-run.
+
+Or manually:
+
+1. Do NOT `pi install` this package.
+2. Keep pi-subagents installed at project or user scope.
+3. Symlink the bridge and its helper modules into your user extensions:
+
+   ```bash
+   PKG=~/.pi/agent/git/github.com/nertzy/pi-interactive-subagents/pi-extension
+   EXT=~/.pi/agent/extensions
+
+   ln -s "$PKG/jacek-bridge.ts" "$EXT/jacek-bridge.ts"
+
+   mkdir -p "$EXT/subagents"
+   ln -s "$PKG/subagents/cmux.ts"          "$EXT/subagents/cmux.ts"
+   ln -s "$PKG/subagents/session.ts"       "$EXT/subagents/session.ts"
+   ln -s "$PKG/subagents/activity.ts"      "$EXT/subagents/activity.ts"
+   ln -s "$PKG/subagents/subagent-done.ts" "$EXT/subagents/subagent-done.ts"
    ```
+
+   > **Why not symlink the whole `subagents/` directory?** pi's extension
+   > discovery treats any subdirectory with an `index.ts` as an extension.
+   > `subagents/index.ts` registers its own `subagent` tool, which collides
+   > with pi-subagents. A real directory with only the needed file symlinks
+   > sidesteps the collision.
+
 4. Set the mux backend in your shell (e.g. `~/.config/fish/conf.d/pi-subagents.fish`):
    ```fish
    set -gx PI_SUBAGENT_MUX cmux
    ```
 5. `/reload` in pi.
 
-Single `subagent(...)` calls will now open a new cmux pane and steer results back asynchronously. The bridge file's imports use `./subagents/...` paths so they resolve correctly from the pi checkout location.
+Single `subagent(...)` calls will now open a new cmux pane and steer results back asynchronously. Chain/parallel calls fall through to Jacek's implementation unchanged.
