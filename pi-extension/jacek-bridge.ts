@@ -24,9 +24,11 @@ import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import {
   existsSync,
   mkdirSync,
+  mkdtempSync,
+  rmSync,
   writeFileSync,
 } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
 // Utilities imported from within this package (relative to pi-extension/).
@@ -48,6 +50,15 @@ import {
   getSubagentActivityFile,
 } from "./subagents/activity.ts";
 
+import {
+  applyThinkingSuffix,
+  findSubagentsRuntimeExtension,
+  resolveIntercomSessionTarget,
+  resolvePersona,
+  resolveSubagentIntercomTarget,
+  type ResolvedPersona,
+} from "./subagents/persona-resolve.ts";
+
 // When installed via `pi install`, pi puts the package at:
 //   ~/.pi/agent/git/github.com/nertzy/pi-interactive-subagents/
 // __dirname resolves to pi-extension/ inside that checkout.
@@ -56,7 +67,7 @@ const SUBAGENT_DONE_EXTENSION = join(__dirname, "subagents", "subagent-done.ts")
 const AGENT_DIR = join(homedir(), ".pi", "agent");
 
 export default function (pi: ExtensionAPI) {
-  pi.on("tool_call", async (event, _ctx) => {
+  pi.on("tool_call", async (event, ctx) => {
     if (event.toolName !== "subagent") return;
 
     const params = event.input as {
@@ -80,11 +91,22 @@ export default function (pi: ExtensionAPI) {
     // Require cmux to be available; fall through to Jacek if not.
     if (!isMuxAvailable()) return;
 
-    const name = params.name ?? "subagent";
+    const cwd = params.cwd ?? process.cwd();
+
+    // Resolve custom personas (.agents/.pi/agents) for model/tools/skills/
+    // systemPrompt fidelity. Builtin personas (implementer, scout, ...) live
+    // inside the pinned pi-subagents package and aren't resolvable here --
+    // fall through to Jacek's native executor so they still run correctly,
+    // just without a cmux pane.
+    const persona = params.agent ? resolvePersona(params.agent, cwd) : undefined;
+    if (params.agent && !persona) return;
+
+    const name = params.name ?? params.agent ?? "subagent";
     const task = params.task;
+    const orchestratorTarget = resolveIntercomSessionTarget(pi.getSessionName(), ctx.sessionManager.getSessionId());
 
     // Launch async — the block return below prevents Jacek's execute.
-    void dispatchSubagent(pi, name, task, params);
+    void dispatchSubagent(pi, name, task, params, persona, orchestratorTarget, cwd);
 
     return {
       block: true,
@@ -105,6 +127,9 @@ async function dispatchSubagent(
     cwd?: string;
     systemPrompt?: string;
   },
+  persona: ResolvedPersona | undefined,
+  orchestratorTarget: string,
+  cwd: string,
 ): Promise<void> {
   // Unique run ID
   const id = Math.random().toString(16).slice(2, 10);
@@ -139,9 +164,34 @@ async function dispatchSubagent(
   parts.push("--session", shellEscape(sessionFile));
   // Load HazAT's subagent-done extension so the child can call subagent_done
   parts.push("-e", shellEscape(SUBAGENT_DONE_EXTENSION));
-  if (params.model) parts.push("--model", shellEscape(params.model));
+
+  // Additively load pi-subagents' own prompt-runtime extension when we can
+  // find it, so inheritProjectContext/inheritSkills are honored the same way
+  // native (non-cmux) children get them. Best-effort: fails open (child sees
+  // full inherited context) rather than blocking cmux dispatch entirely.
+  const runtimeExtPath = persona ? findSubagentsRuntimeExtension(cwd) : undefined;
+  if (runtimeExtPath) parts.push("-e", shellEscape(runtimeExtPath));
+
+  const resolvedModel = params.model ?? persona?.model;
+  const modelArg = applyThinkingSuffix(resolvedModel, persona?.thinking);
+  if (modelArg) parts.push("--model", shellEscape(modelArg));
+
+  if (persona && !persona.inheritSkills) parts.push("--no-skills");
+  if (persona?.tools?.length) parts.push("--tools", shellEscape(persona.tools.join(",")));
+
+  let systemPromptTempDir: string | undefined;
+  if (persona?.systemPrompt) {
+    systemPromptTempDir = mkdtempSync(join(tmpdir(), "jacek-bridge-"));
+    const promptPath = join(systemPromptTempDir, "system-prompt.md");
+    writeFileSync(promptPath, persona.systemPrompt, "utf8");
+    parts.push(persona.systemPromptMode === "replace" ? "--system-prompt" : "--append-system-prompt", shellEscape(promptPath));
+  }
+
   // Task delivered via @file
   parts.push(shellEscape(`@${taskArtifact}`));
+
+  const agentLabel = params.agent ?? name;
+  const intercomSessionName = resolveSubagentIntercomTarget(id, agentLabel, 0);
 
   const envParts = [
     `PI_SUBAGENT_NAME=${shellEscape(name)}`,
@@ -150,8 +200,21 @@ async function dispatchSubagent(
     `PI_SUBAGENT_ACTIVITY_FILE=${shellEscape(activityFile)}`,
     `PI_SUBAGENT_SURFACE=${shellEscape(surface)}`,
     `PI_SUBAGENT_AUTO_EXIT=1`,
+    // Same env contract Jacek's native children get (src/runs/shared/pi-args.ts
+    // + subagent-prompt-runtime.ts) -- this is what activates pi-intercom's
+    // contact_supervisor tool with no extra wiring, since pi-intercom is a
+    // user-scope package that auto-loads for any `pi` invocation.
+    `PI_SUBAGENT_ORCHESTRATOR_TARGET=${shellEscape(orchestratorTarget)}`,
+    `PI_SUBAGENT_RUN_ID=${shellEscape(id)}`,
+    `PI_SUBAGENT_CHILD_AGENT=${shellEscape(agentLabel)}`,
+    `PI_SUBAGENT_CHILD_INDEX=0`,
+    `PI_SUBAGENT_INTERCOM_SESSION_NAME=${shellEscape(intercomSessionName)}`,
   ];
   if (params.agent) envParts.push(`PI_SUBAGENT_AGENT=${shellEscape(params.agent)}`);
+  if (persona && runtimeExtPath) {
+    envParts.push(`PI_SUBAGENT_INHERIT_PROJECT_CONTEXT=${persona.inheritProjectContext ? "1" : "0"}`);
+    envParts.push(`PI_SUBAGENT_INHERIT_SKILLS=${persona.inheritSkills ? "1" : "0"}`);
+  }
 
   const cdPrefix = params.cwd ? `cd ${shellEscape(params.cwd)} && ` : "";
   const command = `${cdPrefix}${envParts.join(" ")} ${parts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
@@ -188,6 +251,7 @@ async function dispatchSubagent(
     }
 
     closeSurface(surface);
+    if (systemPromptTempDir) rmSync(systemPromptTempDir, { recursive: true, force: true });
 
     const content = result.errorMessage
       ? `Sub-agent "${name}" failed (auto-retry exhausted).\n\nError: ${result.errorMessage}`
@@ -213,6 +277,7 @@ async function dispatchSubagent(
     );
   } catch (err: unknown) {
     try { closeSurface(surface); } catch {}
+    if (systemPromptTempDir) { try { rmSync(systemPromptTempDir, { recursive: true, force: true }); } catch {} }
     const msg = err instanceof Error ? err.message : String(err);
     pi.sendMessage(
       {
