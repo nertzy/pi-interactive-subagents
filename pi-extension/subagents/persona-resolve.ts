@@ -17,11 +17,11 @@
  * this file does not track upstream automatically and WILL silently drift.
  *
  * Builtin personas (agents shipped inside the pi-subagents package itself,
- * e.g. implementer/code-reviewer/scout) are intentionally NOT resolved here
- * -- only `.agents`/`.pi/agents` markdown files are scanned. When the
- * requested persona isn't found this way, the caller should fall through to
- * Jacek's native (non-cmux) executor rather than guess at a generic
- * dispatch -- that covers builtins with full fidelity, just without a pane.
+ * e.g. delegate/scout/worker) ARE resolved here: they are plain frontmatter
+ * markdown in `<pi-subagents>/agents/`, scanned at lowest precedence so
+ * `.agents`/`.pi/agents` customs with the same name shadow them -- matching
+ * pi-subagents' own mergeAgentsForScope order. Only a genuinely unknown
+ * agent name should make the caller fall through to Jacek's native executor.
  */
 
 import * as fs from "node:fs";
@@ -151,10 +151,12 @@ function getAgentDir(): string {
   return configured || path.join(os.homedir(), ".pi", "agent");
 }
 
-// Low -> high precedence, matching pi-subagents' resolveUserAgentDirs() +
-// resolveNearestProjectAgentDirs(). Builtins are deliberately excluded.
+// Low -> high precedence, matching pi-subagents' builtin < user < project
+// merge order (mergeAgentsForScope). Builtins scan first so customs shadow.
 function personaSearchDirs(cwd: string): string[] {
+  const builtinDir = findSubagentsBuiltinAgentsDir(cwd);
   const userDirs = [path.join(os.homedir(), ".agents"), path.join(getAgentDir(), "agents")];
+  if (builtinDir) userDirs.unshift(builtinDir);
   const levels = enumerateProjectLevels(cwd);
   const projectCandidates: string[] = [];
   for (const level of levels) {
@@ -314,17 +316,32 @@ export function resolvePersona(runtimeName: string, cwd: string): ResolvedPerson
   };
 }
 
-// Locates the installed pi-subagents package root for `cwd` (project
-// git/npm install, else user-scope) so the cmux child can additively load
-// its subagent-prompt-runtime.ts -- the ONLY mechanism that actually honors
-// inheritProjectContext/inheritSkills=false. Pi's own `--system-prompt` only
-// replaces the base coding-assistant prompt; project AGENTS.md and skills
-// are appended by pi regardless (see `pi --help`, docs/usage.md). Without
-// this extension loaded, inherit flags are silently ignored and persona
-// isolation degrades to "sees everything" -- fails OPEN, not closed, so
-// callers should still proceed with cmux dispatch if this returns undefined.
+// Jacek's subagent-dispatch package has published under more than one npm
+// name over time (pi-subagents, then renamed to pi-cohort) while keeping the
+// same "subagent" tool name and on-disk layout (agents/, src/runs/shared/
+// subagent-prompt-runtime.ts) -- so match on any known name rather than one
+// hardcoded string, or a rename silently breaks builtin-persona resolution
+// and inherit-flag fidelity below.
+const SUBAGENTS_PACKAGE_NAMES = ["pi-subagents", "pi-cohort"];
+
+// Locates the installed pi-subagents/pi-cohort package root for `cwd`
+// (project git/npm install, else user-scope) so the cmux child can
+// additively load its subagent-prompt-runtime.ts -- the ONLY mechanism that
+// actually honors inheritProjectContext/inheritSkills=false. Pi's own
+// `--system-prompt` only replaces the base coding-assistant prompt; project
+// AGENTS.md and skills are appended by pi regardless (see `pi --help`,
+// docs/usage.md). Without this extension loaded, inherit flags are silently
+// ignored and persona isolation degrades to "sees everything" -- fails
+// OPEN, not closed, so callers should still proceed with cmux dispatch if
+// this returns undefined.
 function packageSourceMatches(source: string): boolean {
-  return /pi-subagents(?:@|$)/.test(source.replace(/^(npm:|git:)/, ""));
+  const spec = source.replace(/^(npm:|git:)/, "");
+  return SUBAGENTS_PACKAGE_NAMES.some((name) => new RegExp(`^${name}(?:@|$)`).test(spec));
+}
+
+function npmPackageDirName(source: string): string | undefined {
+  const spec = source.replace(/^npm:/, "");
+  return SUBAGENTS_PACKAGE_NAMES.find((name) => spec === name || spec.startsWith(`${name}@`));
 }
 
 function gitInstallDir(root: string, source: string): string | undefined {
@@ -340,7 +357,10 @@ function gitInstallDir(root: string, source: string): string | undefined {
   return path.join(root, "git", ...segments);
 }
 
-export function findSubagentsRuntimeExtension(cwd: string): string | undefined {
+// Locates the installed pi-subagents package dir for `cwd` (project git/npm
+// install, else user-scope). Shared by the runtime-extension and builtin-
+// persona lookups below.
+function findSubagentsPackageDir(cwd: string): string | undefined {
   const projectRoot = findNearestProjectRoot(cwd);
   const candidateRoots: { settingsPath: string; installRoot: string }[] = [];
   if (projectRoot) {
@@ -356,15 +376,28 @@ export function findSubagentsRuntimeExtension(cwd: string): string | undefined {
     for (const entry of packages) {
       const source = typeof entry === "string" ? entry : (entry as { source?: string } | undefined)?.source;
       if (!source || !packageSourceMatches(source)) continue;
-      const pkgDir = source.startsWith("npm:")
-        ? path.join(installRoot, "npm", "node_modules", "pi-subagents")
+      const npmName = npmPackageDirName(source);
+      const pkgDir = source.startsWith("npm:") && npmName
+        ? path.join(installRoot, "npm", "node_modules", npmName)
         : gitInstallDir(installRoot, source);
-      if (!pkgDir) continue;
-      const runtimePath = path.join(pkgDir, "src", "runs", "shared", "subagent-prompt-runtime.ts");
-      if (fs.existsSync(runtimePath)) return runtimePath;
+      if (pkgDir && fs.existsSync(pkgDir)) return pkgDir;
     }
   }
   return undefined;
+}
+
+function findSubagentsBuiltinAgentsDir(cwd: string): string | undefined {
+  const pkgDir = findSubagentsPackageDir(cwd);
+  if (!pkgDir) return undefined;
+  const agentsDir = path.join(pkgDir, "agents");
+  return isDirectory(agentsDir) ? agentsDir : undefined;
+}
+
+export function findSubagentsRuntimeExtension(cwd: string): string | undefined {
+  const pkgDir = findSubagentsPackageDir(cwd);
+  if (!pkgDir) return undefined;
+  const runtimePath = path.join(pkgDir, "src", "runs", "shared", "subagent-prompt-runtime.ts");
+  return fs.existsSync(runtimePath) ? runtimePath : undefined;
 }
 
 // Mirrors pi-subagents' resolveIntercomSessionTarget / resolveSubagentIntercomTarget
