@@ -41,7 +41,7 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -69,6 +69,7 @@ import {
 import {
   applyThinkingSuffix,
   findSubagentsRuntimeExtension,
+  getAgentDir,
   resolveIntercomSessionTarget,
   resolvePersona,
   resolveSubagentIntercomTarget,
@@ -83,7 +84,15 @@ import {
 const MODULE_DIR = dirname(fileURLToPath(import.meta.url));
 const SUBAGENT_DONE_EXTENSION = join(MODULE_DIR, "subagents", "subagent-done.ts");
 
-const AGENT_DIR = join(homedir(), ".pi", "agent");
+// The active preset's agent dir (respects PI_CODING_AGENT_DIR), not a
+// hardcoded ~/.pi/agent. A cmux pane starts a fresh login shell that does NOT
+// inherit the parent pi's environment, so children must be pinned to this dir
+// explicitly (see PI_CODING_AGENT_DIR in the launch env below); otherwise a
+// pi launched under a preset (e.g. ~/.pi/agent.anthropic) would silently spawn
+// children under the default dir with a different settings.json -- wrong model
+// map, wrong defaultModel, missing packages -- so its subagents pick up the
+// wrong model.
+const AGENT_DIR = getAgentDir();
 const DEFAULT_PARALLEL_CONCURRENCY = 4;
 
 // Independent SINGLE/PARALLEL dispatches resolve on their own timelines, so
@@ -507,6 +516,11 @@ async function runSubagentInPane(spec: ChildSpec): Promise<ChildOutcome> {
     `PI_SUBAGENT_CHILD_AGENT=${shellEscape(agentLabel)}`,
     `PI_SUBAGENT_CHILD_INDEX=${index}`,
     `PI_SUBAGENT_INTERCOM_SESSION_NAME=${shellEscape(intercomSessionName)}`,
+    // Pin the child to the parent's preset dir. Auth is shared (each preset's
+    // auth.json is the same file/symlink), so this needs no secret on disk --
+    // it just selects the right settings.json (model map, defaultModel,
+    // packages) so the child resolves the same model the parent would.
+    `PI_CODING_AGENT_DIR=${shellEscape(AGENT_DIR)}`,
   ];
   if (spec.agent) envParts.push(`PI_SUBAGENT_AGENT=${shellEscape(spec.agent)}`);
   if (persona && runtimeExtPath) {

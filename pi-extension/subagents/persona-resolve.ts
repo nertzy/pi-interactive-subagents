@@ -144,7 +144,13 @@ function dedupeByRealPath(dirs: string[]): string[] {
   return result.reverse();
 }
 
-function getAgentDir(): string {
+// Resolves the active pi agent directory (the per-preset home holding
+// settings.json, auth.json, sessions/, artifacts/). Mirrors pi's own
+// PI_CODING_AGENT_DIR handling so a preset launch (e.g. a `pi-<preset>`
+// wrapper that exports PI_CODING_AGENT_DIR) resolves to the same dir here as
+// inside pi. Exported so jacek-bridge can pin cmux children to the parent's
+// dir rather than the default.
+export function getAgentDir(): string {
   const configured = process.env.PI_CODING_AGENT_DIR;
   if (configured === "~") return os.homedir();
   if (configured?.startsWith("~/")) return path.join(os.homedir(), configured.slice(2));
