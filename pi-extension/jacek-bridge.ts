@@ -33,7 +33,7 @@
  *   4. Set PI_SUBAGENT_MUX=cmux (or tmux/zellij/wezterm) in your shell.
  */
 
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import {
   existsSync,
   mkdirSync,
@@ -43,6 +43,7 @@ import {
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 // Utilities imported from within this package (relative to pi-extension/).
 import {
@@ -76,11 +77,85 @@ import {
 
 // When installed via `pi install`, pi puts the package at:
 //   ~/.pi/agent/git/github.com/nertzy/pi-interactive-subagents/
-// __dirname resolves to pi-extension/ inside that checkout.
-const SUBAGENT_DONE_EXTENSION = join(__dirname, "subagents", "subagent-done.ts");
+// import.meta.url resolves to this file inside that checkout; dirname of it
+// is pi-extension/. (Not __dirname: this module runs under "type": "module",
+// and pi's own dev docs ban __dirname for package assets.)
+const MODULE_DIR = dirname(fileURLToPath(import.meta.url));
+const SUBAGENT_DONE_EXTENSION = join(MODULE_DIR, "subagents", "subagent-done.ts");
 
 const AGENT_DIR = join(homedir(), ".pi", "agent");
 const DEFAULT_PARALLEL_CONCURRENCY = 4;
+
+// Independent SINGLE/PARALLEL dispatches resolve on their own timelines, so
+// two children finishing seconds apart would otherwise each fire their own
+// triggerTurn:true steer -- stacking separate wake-up turns instead of one.
+// Mirrors pi-intercom's own pendingIdleMessages/scheduleInboundFlush pattern
+// (index.ts): queue every completed result, debounce briefly, then deliver
+// the batch as a single triggered turn (first entry "steer", rest
+// "followUp" so they ride the same turn instead of spawning more).
+const RESULT_FLUSH_DELAY_MS = 200;
+const RESULT_IDLE_RETRY_MS = 500;
+
+interface PendingResult {
+  customType: string;
+  content: string;
+  details: unknown;
+}
+
+const pendingResults: PendingResult[] = [];
+let resultFlushTimer: NodeJS.Timeout | null = null;
+
+function scheduleResultFlush(pi: ExtensionAPI, ctx: ExtensionContext, delayMs = RESULT_FLUSH_DELAY_MS): void {
+  if (resultFlushTimer) clearTimeout(resultFlushTimer);
+  resultFlushTimer = setTimeout(() => {
+    resultFlushTimer = null;
+    flushPendingResults(pi, ctx);
+  }, delayMs);
+}
+
+function flushPendingResults(pi: ExtensionAPI, ctx: ExtensionContext): void {
+  if (pendingResults.length === 0) return;
+
+  let idle: boolean;
+  try {
+    idle = ctx.isIdle();
+  } catch {
+    // Stale/torn-down context (session reloaded or exited); drop the batch
+    // rather than deliver through a dead context.
+    return;
+  }
+  if (!idle) {
+    scheduleResultFlush(pi, ctx, RESULT_IDLE_RETRY_MS);
+    return;
+  }
+
+  const batch = pendingResults.splice(0, pendingResults.length);
+  batch.forEach((entry, i) => {
+    pi.sendMessage(
+      { customType: entry.customType, content: entry.content, display: true, details: entry.details },
+      i === 0 ? { triggerTurn: true, deliverAs: "steer" } : { deliverAs: "followUp" },
+    );
+  });
+}
+
+function deliverResult(pi: ExtensionAPI, ctx: ExtensionContext, entry: PendingResult): void {
+  pendingResults.push(entry);
+  scheduleResultFlush(pi, ctx);
+}
+
+// Test-only surface (mirrors the __test__ convention in subagents/index.ts).
+// Module-level pendingResults/resultFlushTimer are process-wide singletons;
+// tests must reset between cases via resetForTest().
+export const __test__ = {
+  deliverResult,
+  resetForTest(): void {
+    if (resultFlushTimer) {
+      clearTimeout(resultFlushTimer);
+      resultFlushTimer = null;
+    }
+    pendingResults.length = 0;
+  },
+};
 
 interface SubagentParams {
   name?: string;
@@ -184,7 +259,7 @@ export default function (pi: ExtensionAPI) {
         1,
         Math.floor(params.concurrency ?? DEFAULT_PARALLEL_CONCURRENCY),
       );
-      void dispatchParallel(pi, specs, concurrency);
+      void dispatchParallel(pi, ctx, specs, concurrency);
       return {
         block: true,
         reason: `Rerouted ${specs.length} parallel subagent(s) to cmux panes (jacek-bridge). Aggregate result will be delivered as a steer message.`,
@@ -215,7 +290,7 @@ export default function (pi: ExtensionAPI) {
       orchestratorTarget,
     };
 
-    void dispatchSingle(pi, spec);
+    void dispatchSingle(pi, ctx, spec);
     return {
       block: true,
       reason: `Rerouted to cmux pane (jacek-bridge). Result will be delivered as a steer message.`,
@@ -266,7 +341,7 @@ function buildParallelSpecs(
   return specs;
 }
 
-async function dispatchSingle(pi: ExtensionAPI, spec: ChildSpec): Promise<void> {
+async function dispatchSingle(pi: ExtensionAPI, ctx: ExtensionContext, spec: ChildSpec): Promise<void> {
   const outcome = await runSubagentInPane(spec);
   const content = outcome.errorMessage
     ? `Sub-agent "${outcome.name}" failed (auto-retry exhausted).\n\nError: ${outcome.errorMessage}`
@@ -274,26 +349,23 @@ async function dispatchSingle(pi: ExtensionAPI, spec: ChildSpec): Promise<void> 
     ? `Sub-agent "${outcome.name}" failed (exit ${outcome.exitCode}, ${outcome.elapsedText}).\n\n${outcome.summary}`
     : `Sub-agent "${outcome.name}" completed (${outcome.elapsedText}).\n\n${outcome.summary}`;
 
-  pi.sendMessage(
-    {
-      customType: "subagent_result",
-      content,
-      display: true,
-      details: {
-        name: outcome.name,
-        task: spec.task,
-        agent: spec.agent,
-        exitCode: outcome.exitCode,
-        sessionFile: outcome.sessionFile,
-        error: outcome.errorMessage,
-      },
+  deliverResult(pi, ctx, {
+    customType: "subagent_result",
+    content,
+    details: {
+      name: outcome.name,
+      task: spec.task,
+      agent: spec.agent,
+      exitCode: outcome.exitCode,
+      sessionFile: outcome.sessionFile,
+      error: outcome.errorMessage,
     },
-    { triggerTurn: true, deliverAs: "steer" },
-  );
+  });
 }
 
 async function dispatchParallel(
   pi: ExtensionAPI,
+  ctx: ExtensionContext,
   specs: ChildSpec[],
   concurrency: number,
 ): Promise<void> {
@@ -317,26 +389,22 @@ async function dispatchParallel(
     return `${o.index + 1}. ${o.name} - ${status}\n${o.summary}`;
   });
 
-  pi.sendMessage(
-    {
-      customType: "subagent_result",
-      content: `${header}\n\n${sections.join("\n\n")}`,
-      display: true,
-      details: {
-        mode: "parallel",
-        runId: specs[0]?.runId,
-        children: outcomes.map((o) => ({
-          name: o.name,
-          agent: o.agent,
-          index: o.index,
-          exitCode: o.exitCode,
-          sessionFile: o.sessionFile,
-          error: o.errorMessage,
-        })),
-      },
+  deliverResult(pi, ctx, {
+    customType: "subagent_result",
+    content: `${header}\n\n${sections.join("\n\n")}`,
+    details: {
+      mode: "parallel",
+      runId: specs[0]?.runId,
+      children: outcomes.map((o) => ({
+        name: o.name,
+        agent: o.agent,
+        index: o.index,
+        exitCode: o.exitCode,
+        sessionFile: o.sessionFile,
+        error: o.errorMessage,
+      })),
     },
-    { triggerTurn: true, deliverAs: "steer" },
-  );
+  });
 }
 
 async function runPool<T>(jobs: (() => Promise<T>)[], limit: number): Promise<T[]> {
