@@ -38,7 +38,11 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
+  realpathSync,
+  renameSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -94,6 +98,77 @@ const SUBAGENT_DONE_EXTENSION = join(MODULE_DIR, "subagents", "subagent-done.ts"
 // wrong model.
 const AGENT_DIR = getAgentDir();
 const DEFAULT_PARALLEL_CONCURRENCY = 4;
+
+// Wall-clock stamp of when this pi session booted (the extension module is
+// evaluated once at pi startup). A pane whose cwd was born after this is a
+// directory this session created -- the only kind maybeTrustSessionCwd will
+// auto-trust.
+const SESSION_START_MS = Date.now();
+
+// pi prompts interactively before working in an untrusted folder that carries
+// project-local config/skills, which stalls a non-interactive cmux pane at
+// launch (the child pi blocks on the prompt and never runs the task). When a
+// pane's cwd came into existence during THIS pi session -- e.g. a worktree
+// created mid-session -- pre-trust it so the child skips the prompt. Scoped
+// tightly on purpose: a dir whose birthtime predates the session is left alone,
+// so this never silently trusts a pre-existing folder the user never opted
+// into, and an explicit prior decision (true OR false) on the cwd or any nearer
+// ancestor is always respected. Writes only AGENT_DIR's trust.json in pi's own
+// on-disk shape (canonical-path keys, sorted, trailing newline); the child pane
+// is pinned to that preset dir via PI_CODING_AGENT_DIR, so it is the file it
+// reads. Atomic temp+rename keeps a concurrent reader from seeing a partial
+// file. Takes effect on the next pi start (extensions load once at boot).
+function maybeTrustSessionCwd(cwd: string): void {
+  let canonical: string;
+  let birthMs: number;
+  try {
+    canonical = realpathSync(cwd);
+    birthMs = statSync(canonical).birthtimeMs;
+  } catch {
+    return; // cwd missing/unreadable -> nothing to do
+  }
+  // birthtime unavailable (0) or predating the session -> not ours to trust.
+  if (!birthMs || birthMs < SESSION_START_MS) return;
+
+  const trustFile = join(AGENT_DIR, "trust.json");
+  let data: Record<string, boolean | null> = {};
+  if (existsSync(trustFile)) {
+    try {
+      const parsed: unknown = JSON.parse(readFileSync(trustFile, "utf8"));
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return;
+      data = parsed as Record<string, boolean | null>;
+    } catch {
+      return; // never clobber a trust store we can't parse
+    }
+  }
+
+  // Mirror pi's findNearestTrustEntry: the nearest ancestor carrying an
+  // explicit true/false decides. Already-true -> no prompt, nothing to do;
+  // explicit false nearer than any true -> the user opted out, respect it.
+  for (let dir = canonical; ; ) {
+    const value = data[dir];
+    if (value === true || value === false) return;
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+
+  data[canonical] = true;
+  const sorted: Record<string, boolean | null> = {};
+  for (const key of Object.keys(data).sort()) {
+    const v = data[key];
+    if (v === true || v === false || v === null) sorted[key] = v;
+  }
+  try {
+    mkdirSync(dirname(trustFile), { recursive: true });
+    const tmp = join(AGENT_DIR, `trust.json.${process.pid}.${Date.now()}.tmp`);
+    writeFileSync(tmp, `${JSON.stringify(sorted, null, 2)}\n`, "utf8");
+    renameSync(tmp, trustFile);
+    console.error(`[jacek-bridge] auto-trusted session-created cwd for pi: ${canonical}`);
+  } catch (err) {
+    console.error(`[jacek-bridge] failed to auto-trust cwd ${canonical}:`, err);
+  }
+}
 
 // Independent SINGLE/PARALLEL dispatches resolve on their own timelines, so
 // two children finishing seconds apart would otherwise each fire their own
@@ -493,6 +568,12 @@ function formatElapsed(startTime: number): string {
 // Core pane dispatch. Never throws; failures come back in the outcome.
 async function runSubagentInPane(spec: ChildSpec): Promise<ChildOutcome> {
   const { runId, index, name, task, cwd, persona } = spec;
+
+  // Skip pi's trust prompt for a worktree this session created (see helper).
+  // Synchronous and runs before any await, so parallel pool workers can't
+  // interleave the trust.json read-modify-write.
+  maybeTrustSessionCwd(cwd);
+
   const childId = `${runId}-${index}`;
   const startTime = Date.now();
 
@@ -583,7 +664,16 @@ async function runSubagentInPane(spec: ChildSpec): Promise<ChildOutcome> {
   }
 
   const cdPrefix = `cd ${shellEscape(cwd)} && `;
-  const command = `${cdPrefix}${envParts.join(" ")} ${parts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
+  // Strip Ghostty terminal identity from the child so pi-quiver's session-name
+  // extension skips its OSC-2 tab rename. Under a Ghostty-backed cmux that raw
+  // OSC-2 title bleeds into the shared workspace pill, so a subagent setting its
+  // (intercom) session name clobbers the parent session's workspace name. With
+  // these vars gone isGhosttyActive() is false and the rename no-ops; the child
+  // keeps its session name for intercom and workspace/tab naming stays the
+  // parent's alone.
+  const stripGhosttyIdent =
+    "env -u TERM_PROGRAM -u GHOSTTY_RESOURCES_DIR -u GHOSTTY_BIN_DIR ";
+  const command = `${cdPrefix}${envParts.join(" ")} ${stripGhosttyIdent}${parts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
 
   const launchScript = join(artifactDir, "launch.sh");
 
