@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import { __test__ } from "../pi-extension/jacek-bridge.ts";
 
 const { deliverResult, resetForTest } = __test__;
+// __test__.setOrphanSink is used directly in the torn-down-context test.
 
 function createMockExtensionApi() {
   const sentMessages: Array<{ message: any; options?: any }> = [];
@@ -115,8 +116,10 @@ describe("jacek-bridge result coalescing", () => {
     assert.equal(sentMessages.length, 0);
   });
 
-  it("drops a pending batch if the context throws (stale/torn-down session)", () => {
+  it("persists a pending batch to the orphan sink if the context throws (stale/torn-down session)", () => {
     const { api, sentMessages } = createMockExtensionApi();
+    const orphaned: Array<Array<{ content: string }>> = [];
+    __test__.setOrphanSink((batch) => orphaned.push(batch as any));
     const ctx = {
       isIdle: () => {
         throw new Error("session reloaded");
@@ -126,7 +129,24 @@ describe("jacek-bridge result coalescing", () => {
     deliverResult(api, ctx, result(1));
     mock.timers.tick(200);
 
-    assert.equal(sentMessages.length, 0, "no throw escapes, no message delivered");
+    assert.equal(sentMessages.length, 0, "not delivered through a dead context");
+    assert.equal(orphaned.length, 1, "batch handed to the orphan sink rather than silently dropped");
+    assert.equal(orphaned[0][0].content, "result 1");
+  });
+
+  it("force-delivers as a triggered steer once the max idle-wait elapses, even while busy", () => {
+    mock.timers.reset();
+    mock.timers.enable({ apis: ["setTimeout", "Date"] });
+    const { api, sentMessages } = createMockExtensionApi();
+    const { ctx } = createMockContext(false); // never goes idle
+
+    deliverResult(api, ctx, result(1));
+    mock.timers.tick(200); // first flush: busy, start deferring
+    // Advance well past the 30s cap at the 500ms idle-retry cadence.
+    for (let i = 0; i < 61; i++) mock.timers.tick(500);
+
+    assert.equal(sentMessages.length, 1, "force-delivered after the max wait despite never idling");
+    assert.deepEqual(sentMessages[0].options, { triggerTurn: true, deliverAs: "steer" });
   });
 
   it("starts a fresh batch after a prior batch has flushed", () => {

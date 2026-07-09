@@ -104,6 +104,12 @@ const DEFAULT_PARALLEL_CONCURRENCY = 4;
 // "followUp" so they ride the same turn instead of spawning more).
 const RESULT_FLUSH_DELAY_MS = 200;
 const RESULT_IDLE_RETRY_MS = 500;
+// A steer is designed to interrupt a running turn, so deferring until the
+// parent goes idle only adds latency -- and a long orchestrator turn can defer
+// a batch for minutes. Cap the idle-wait: once a deferred batch has waited this
+// long, force-deliver it as a steer even while the parent is busy, trading a
+// little batching for a bound on worst-case latency.
+const RESULT_MAX_WAIT_MS = 30_000;
 
 interface PendingResult {
   customType: string;
@@ -113,6 +119,30 @@ interface PendingResult {
 
 const pendingResults: PendingResult[] = [];
 let resultFlushTimer: NodeJS.Timeout | null = null;
+// Wall-clock stamp of when the current batch first found the parent busy; null
+// when nothing is deferred. Drives the RESULT_MAX_WAIT_MS force-deliver.
+let firstDeferredAt: number | null = null;
+
+type OrphanSink = (batch: PendingResult[]) => void;
+
+// A torn-down context can't be steered into, but completed results must not
+// vanish silently -- write them somewhere the user can recover them.
+function defaultOrphanSink(batch: PendingResult[]): void {
+  try {
+    const path = join(tmpdir(), `jacek-bridge-orphaned-results-${Date.now()}.json`);
+    writeFileSync(path, JSON.stringify(batch, null, 2));
+    console.error(
+      `[jacek-bridge] context torn down; ${batch.length} subagent result(s) persisted to ${path}`,
+    );
+  } catch (err) {
+    console.error(
+      `[jacek-bridge] context torn down; failed to persist ${batch.length} orphaned subagent result(s):`,
+      err,
+    );
+  }
+}
+
+let orphanSink: OrphanSink = defaultOrphanSink;
 
 function scheduleResultFlush(pi: ExtensionAPI, ctx: ExtensionContext, delayMs = RESULT_FLUSH_DELAY_MS): void {
   if (resultFlushTimer) clearTimeout(resultFlushTimer);
@@ -122,23 +152,9 @@ function scheduleResultFlush(pi: ExtensionAPI, ctx: ExtensionContext, delayMs = 
   }, delayMs);
 }
 
-function flushPendingResults(pi: ExtensionAPI, ctx: ExtensionContext): void {
-  if (pendingResults.length === 0) return;
-
-  let idle: boolean;
-  try {
-    idle = ctx.isIdle();
-  } catch {
-    // Stale/torn-down context (session reloaded or exited); drop the batch
-    // rather than deliver through a dead context.
-    return;
-  }
-  if (!idle) {
-    scheduleResultFlush(pi, ctx, RESULT_IDLE_RETRY_MS);
-    return;
-  }
-
+function emitPendingBatch(pi: ExtensionAPI): void {
   const batch = pendingResults.splice(0, pendingResults.length);
+  firstDeferredAt = null;
   batch.forEach((entry, i) => {
     pi.sendMessage(
       { customType: entry.customType, content: entry.content, display: true, details: entry.details },
@@ -147,22 +163,60 @@ function flushPendingResults(pi: ExtensionAPI, ctx: ExtensionContext): void {
   });
 }
 
+function flushPendingResults(pi: ExtensionAPI, ctx: ExtensionContext): void {
+  if (pendingResults.length === 0) return;
+
+  let idle: boolean;
+  try {
+    idle = ctx.isIdle();
+  } catch {
+    // Stale/torn-down context (session reloaded or exited). We can't steer
+    // through a dead context, so hand the batch to the orphan sink rather than
+    // dropping it silently.
+    const batch = pendingResults.splice(0, pendingResults.length);
+    firstDeferredAt = null;
+    orphanSink(batch);
+    return;
+  }
+
+  if (idle) {
+    emitPendingBatch(pi);
+    return;
+  }
+
+  // Parent is busy. Bound how long we defer: reschedule until RESULT_MAX_WAIT_MS
+  // has elapsed since the batch first deferred, then force-deliver the steer
+  // regardless of idle state.
+  const now = Date.now();
+  if (firstDeferredAt === null) firstDeferredAt = now;
+  if (now - firstDeferredAt >= RESULT_MAX_WAIT_MS) {
+    emitPendingBatch(pi);
+    return;
+  }
+  scheduleResultFlush(pi, ctx, RESULT_IDLE_RETRY_MS);
+}
+
 function deliverResult(pi: ExtensionAPI, ctx: ExtensionContext, entry: PendingResult): void {
   pendingResults.push(entry);
   scheduleResultFlush(pi, ctx);
 }
 
 // Test-only surface (mirrors the __test__ convention in subagents/index.ts).
-// Module-level pendingResults/resultFlushTimer are process-wide singletons;
-// tests must reset between cases via resetForTest().
+// Module-level pendingResults/resultFlushTimer/firstDeferredAt are process-wide
+// singletons; tests must reset between cases via resetForTest().
 export const __test__ = {
   deliverResult,
+  setOrphanSink(sink: OrphanSink): void {
+    orphanSink = sink;
+  },
   resetForTest(): void {
     if (resultFlushTimer) {
       clearTimeout(resultFlushTimer);
       resultFlushTimer = null;
     }
     pendingResults.length = 0;
+    firstDeferredAt = null;
+    orphanSink = defaultOrphanSink;
   },
 };
 
