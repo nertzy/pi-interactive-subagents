@@ -1,7 +1,7 @@
 import { describe, it, mock, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 
-import { __test__ } from "../pi-extension/jacek-bridge.ts";
+import { __test__ } from "../pi-extension/cohort-bridge.ts";
 
 const { deliverResult, resetForTest } = __test__;
 // __test__.setOrphanSink is used directly in the torn-down-context test.
@@ -34,7 +34,7 @@ function result(n: number) {
   return { customType: "subagent_result", content: `result ${n}`, details: { n } };
 }
 
-describe("jacek-bridge result coalescing", () => {
+describe("cohort-bridge result coalescing", () => {
   beforeEach(() => {
     mock.timers.enable({ apis: ["setTimeout"] });
   });

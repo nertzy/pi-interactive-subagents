@@ -1,35 +1,40 @@
 /**
- * jacek-bridge.ts
+ * cohort-bridge.ts
  *
- * Intercepts Jacek's pi-subagents `subagent` tool calls and re-dispatches them
- * through pi-interactive-subagents' cmux machinery.
+ * Intercepts pi-cohort's (Jacek's subagent-dispatch package, formerly
+ * pi-subagents) `subagent` tool calls and re-dispatches them through
+ * pi-interactive-subagents' cmux machinery.
  *
  * Why: Both packages register a tool named "subagent". Projects that pin
- * pi-subagents as a team contract can't install pi-interactive-subagents as a
+ * pi-cohort as a team contract can't install pi-interactive-subagents as a
  * package without a name collision. This bridge lives as a user-scope extension
  * that silently re-routes subagent calls so they spawn in real cmux panes and
  * steer results back when done, without touching any checked-in project files.
  *
  * What is intercepted:
  * - SINGLE calls (task, optional agent). Builtin personas (delegate, scout,
- *   worker, ...) resolve from the pinned pi-subagents package's agents/ dir;
+ *   worker, ...) resolve from the pinned pi-cohort package's agents/ dir;
  *   customs from .agents/.pi/agents shadow them.
  * - PARALLEL calls (tasks[]) whose entries stick to agent/task/model/cwd/
- *   count/label. Each child gets its own pane; the bridge itself is the
- *   orchestrator (async, non-blocking) so there is no top-level pane, and one
- *   aggregate result is steered back when all children finish.
+ *   count/label/output. Each child gets its own pane; the bridge itself is
+ *   the orchestrator (async, non-blocking) so there is no top-level pane, and
+ *   one aggregate result is steered back when all children finish.
+ * - `output` (string path or false), including outputMode inline/file-only:
+ *   the child is instructed to write the file; if it doesn't, its final
+ *   summary is persisted there, mirroring pi-cohort's contract (see
+ *   subagents/output.ts for the one deliberate deviation).
  *
- * What falls through to Jacek's native executor:
+ * What falls through to pi-cohort's native executor:
  * - CHAIN calls (sequential {previous} templating has no pane equivalent).
  * - Calls using semantics the pane launch can't honor: worktree, acceptance,
- *   context: "fork", outputSchema, structured output plumbing, per-task
- *   reads/skill overrides.
- * - Genuinely unknown agent names (let Jacek produce the proper error).
+ *   context: "fork", outputSchema, structured output plumbing, skill
+ *   overrides, per-task reads.
+ * - Genuinely unknown agent names (let pi-cohort produce the proper error).
  *
- * Setup (see README § Using alongside pi-subagents):
+ * Setup (see README § Using alongside pi-cohort):
  *   1. Do NOT install pi-interactive-subagents as a pi package (name conflict).
- *   2. Keep pi-subagents installed at project or user scope.
- *   3. Copy or symlink this file to ~/.pi/agent/extensions/jacek-bridge.ts
+ *   2. Keep pi-cohort installed at project or user scope.
+ *   3. Copy or symlink this file to ~/.pi/agent/extensions/cohort-bridge.ts
  *   4. Set PI_SUBAGENT_MUX=cmux (or tmux/zellij/wezterm) in your shell.
  */
 
@@ -69,6 +74,13 @@ import {
 import {
   getSubagentActivityFile,
 } from "./subagents/activity.ts";
+
+import {
+  injectOutputInstruction,
+  resolveOutputPath,
+  resolveOutputAfterRun,
+  snapshotOutput,
+} from "./subagents/output.ts";
 
 import {
   applyThinkingSuffix,
@@ -164,9 +176,9 @@ function maybeTrustSessionCwd(cwd: string): void {
     const tmp = join(AGENT_DIR, `trust.json.${process.pid}.${Date.now()}.tmp`);
     writeFileSync(tmp, `${JSON.stringify(sorted, null, 2)}\n`, "utf8");
     renameSync(tmp, trustFile);
-    console.error(`[jacek-bridge] auto-trusted session-created cwd for pi: ${canonical}`);
+    console.error(`[cohort-bridge] auto-trusted session-created cwd for pi: ${canonical}`);
   } catch (err) {
-    console.error(`[jacek-bridge] failed to auto-trust cwd ${canonical}:`, err);
+    console.error(`[cohort-bridge] failed to auto-trust cwd ${canonical}:`, err);
   }
 }
 
@@ -204,14 +216,14 @@ type OrphanSink = (batch: PendingResult[]) => void;
 // vanish silently -- write them somewhere the user can recover them.
 function defaultOrphanSink(batch: PendingResult[]): void {
   try {
-    const path = join(tmpdir(), `jacek-bridge-orphaned-results-${Date.now()}.json`);
+    const path = join(tmpdir(), `cohort-bridge-orphaned-results-${Date.now()}.json`);
     writeFileSync(path, JSON.stringify(batch, null, 2));
     console.error(
-      `[jacek-bridge] context torn down; ${batch.length} subagent result(s) persisted to ${path}`,
+      `[cohort-bridge] context torn down; ${batch.length} subagent result(s) persisted to ${path}`,
     );
   } catch (err) {
     console.error(
-      `[jacek-bridge] context torn down; failed to persist ${batch.length} orphaned subagent result(s):`,
+      `[cohort-bridge] context torn down; failed to persist ${batch.length} orphaned subagent result(s):`,
       err,
     );
   }
@@ -310,6 +322,9 @@ interface SubagentParams {
   worktree?: boolean;
   context?: string;
   acceptance?: unknown;
+  output?: string | boolean;
+  outputMode?: string;
+  skill?: unknown;
 }
 
 interface ParallelTaskEntry {
@@ -319,11 +334,13 @@ interface ParallelTaskEntry {
   cwd?: string;
   count?: number;
   label?: string;
+  output?: string | boolean;
+  outputMode?: string;
 }
 
 // Per-entry keys the pane launch can honor. Anything else (outputSchema,
-// acceptance, reads, skill, output, ...) changes semantics we can't
-// reproduce, so its presence falls the whole call through to Jacek.
+// acceptance, reads, skill, ...) changes semantics we can't reproduce, so
+// its presence falls the whole call through to pi-cohort.
 const SUPPORTED_PARALLEL_TASK_KEYS = new Set([
   "agent",
   "task",
@@ -332,7 +349,24 @@ const SUPPORTED_PARALLEL_TASK_KEYS = new Set([
   "count",
   "label",
   "phase",
+  "output",
+  "outputMode",
 ]);
+
+// output must be a concrete path or an explicit opt-out; outputMode must pair
+// with a path when file-only (mirrors pi-cohort's validation). `output: true`
+// means "use the executor's default path", which the bridge doesn't have.
+function normalizeOutput(
+  output: string | boolean | undefined,
+  outputMode: string | undefined,
+  cwd: string,
+): { outputPath?: string; outputMode?: "inline" | "file-only" } | undefined {
+  if (output === true) return undefined;
+  if (outputMode !== undefined && outputMode !== "inline" && outputMode !== "file-only") return undefined;
+  const outputPath = resolveOutputPath(output, cwd);
+  if (outputMode === "file-only" && !outputPath) return undefined; // let pi-cohort error properly
+  return { outputPath, outputMode: outputMode as "inline" | "file-only" | undefined };
+}
 
 interface ChildSpec {
   runId: string;
@@ -344,6 +378,8 @@ interface ChildSpec {
   cwd: string;
   persona?: ResolvedPersona;
   orchestratorTarget: string;
+  outputPath?: string;
+  outputMode?: "inline" | "file-only";
 }
 
 interface ChildOutcome {
@@ -355,6 +391,7 @@ interface ChildOutcome {
   summary: string;
   sessionFile: string;
   errorMessage?: string;
+  savedOutputPath?: string;
 }
 
 export default function (pi: ExtensionAPI) {
@@ -364,9 +401,9 @@ export default function (pi: ExtensionAPI) {
   // load time, with no other visible sign why panes aren't appearing.
   const activeBackend = getMuxBackend();
   if (activeBackend) {
-    console.error(`[jacek-bridge] active: routing subagent calls to ${activeBackend} panes.`);
+    console.error(`[cohort-bridge] active: routing subagent calls to ${activeBackend} panes.`);
   } else {
-    console.error(`[jacek-bridge] inactive (${muxSetupHint()}); subagent calls fall through to Jacek's native executor.`);
+    console.error(`[cohort-bridge] inactive (${muxSetupHint()}); subagent calls fall through to pi-cohort's native executor.`);
   }
 
   pi.on("tool_call", async (event, ctx) => {
@@ -374,12 +411,13 @@ export default function (pi: ExtensionAPI) {
 
     const params = event.input as SubagentParams;
 
-    // Chain mode stays with Jacek's implementation (sequential dependencies).
+    // Chain mode stays with pi-cohort's implementation (sequential dependencies).
     if (params.chain) return;
     // Semantics a pane launch can't honor.
     if (params.worktree || params.acceptance || params.context === "fork") return;
+    if (params.skill !== undefined && params.skill !== false) return;
 
-    // Require cmux to be available; fall through to Jacek if not.
+    // Require cmux to be available; fall through to pi-cohort if not.
     if (!isMuxAvailable()) return;
 
     const runId = Math.random().toString(16).slice(2, 10);
@@ -391,7 +429,7 @@ export default function (pi: ExtensionAPI) {
     // ---- PARALLEL mode ----
     if (params.tasks) {
       const specs = buildParallelSpecs(params, runId, orchestratorTarget);
-      if (!specs) return; // unsupported shape or unknown persona -> Jacek
+      if (!specs) return; // unsupported shape or unknown persona -> pi-cohort
 
       const concurrency = Math.max(
         1,
@@ -400,7 +438,7 @@ export default function (pi: ExtensionAPI) {
       void dispatchParallel(pi, ctx, specs, concurrency);
       return {
         block: true,
-        reason: `Rerouted ${specs.length} parallel subagent(s) to cmux panes (jacek-bridge). Aggregate result will be delivered as a steer message.`,
+        reason: `Rerouted ${specs.length} parallel subagent(s) to cmux panes (cohort-bridge). Aggregate result will be delivered as a steer message.`,
       };
     }
 
@@ -409,10 +447,13 @@ export default function (pi: ExtensionAPI) {
 
     const cwd = params.cwd ?? process.cwd();
 
+    const output = normalizeOutput(params.output, params.outputMode, cwd);
+    if (!output) return;
+
     // Resolve the persona for model/tools/skills/systemPrompt fidelity.
-    // Builtins now resolve from the pi-subagents package's agents/ dir;
-    // only a genuinely unknown agent name falls through to Jacek so it can
-    // produce the proper error.
+    // Builtins now resolve from the pi-cohort package's agents/ dir;
+    // only a genuinely unknown agent name falls through to pi-cohort so it
+    // can produce the proper error.
     const persona = params.agent ? resolvePersona(params.agent, cwd) : undefined;
     if (params.agent && !persona) return;
 
@@ -426,18 +467,20 @@ export default function (pi: ExtensionAPI) {
       cwd,
       persona,
       orchestratorTarget,
+      outputPath: output.outputPath,
+      outputMode: output.outputMode,
     };
 
     void dispatchSingle(pi, ctx, spec);
     return {
       block: true,
-      reason: `Rerouted to cmux pane (jacek-bridge). Result will be delivered as a steer message.`,
+      reason: `Rerouted to cmux pane (cohort-bridge). Result will be delivered as a steer message.`,
     };
   });
 }
 
 // Validates the tasks[] payload and expands count. Returns undefined when
-// anything about the call means Jacek should run it natively instead.
+// anything about the call means pi-cohort should run it natively instead.
 function buildParallelSpecs(
   params: SubagentParams,
   runId: string,
@@ -459,7 +502,10 @@ function buildParallelSpecs(
 
     const cwd = task.cwd ?? params.cwd ?? process.cwd();
     const persona = resolvePersona(task.agent, cwd);
-    if (!persona) return undefined; // unknown agent -> let Jacek error properly
+    if (!persona) return undefined; // unknown agent -> let pi-cohort error properly
+
+    const output = normalizeOutput(task.output, task.outputMode, cwd);
+    if (!output) return undefined;
 
     const count = Math.max(1, Math.floor(task.count ?? 1));
     for (let i = 0; i < count; i++) {
@@ -473,6 +519,8 @@ function buildParallelSpecs(
         cwd,
         persona,
         orchestratorTarget,
+        outputPath: output.outputPath,
+        outputMode: output.outputMode,
       });
     }
   }
@@ -497,6 +545,7 @@ async function dispatchSingle(pi: ExtensionAPI, ctx: ExtensionContext, spec: Chi
       exitCode: outcome.exitCode,
       sessionFile: outcome.sessionFile,
       error: outcome.errorMessage,
+      outputPath: outcome.savedOutputPath,
     },
   });
 }
@@ -540,6 +589,7 @@ async function dispatchParallel(
         exitCode: o.exitCode,
         sessionFile: o.sessionFile,
         error: o.errorMessage,
+        outputPath: o.savedOutputPath,
       })),
     },
   });
@@ -578,7 +628,7 @@ async function runSubagentInPane(spec: ChildSpec): Promise<ChildOutcome> {
   const startTime = Date.now();
 
   // Session file
-  const sessionDir = join(AGENT_DIR, "sessions", "--jacek-bridge--");
+  const sessionDir = join(AGENT_DIR, "sessions", "--cohort-bridge--");
   mkdirSync(sessionDir, { recursive: true });
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 23) + "Z";
   const sessionFile = join(sessionDir, `${timestamp}_${childId}.jsonl`);
@@ -591,7 +641,8 @@ async function runSubagentInPane(spec: ChildSpec): Promise<ChildOutcome> {
   // Write task to an artifact file (avoids shell-escaping multiline strings)
   const modeHint = "Complete your task autonomously.";
   const summaryInstruction = "Your FINAL assistant message should summarize what you accomplished.";
-  const fullTask = `${modeHint}\n\n${task}\n\n${summaryInstruction}`;
+  const taskWithOutput = injectOutputInstruction(task, spec.outputPath);
+  const fullTask = `${modeHint}\n\n${taskWithOutput}\n\n${summaryInstruction}`;
   const taskArtifact = join(artifactDir, "task.md");
   mkdirSync(artifactDir, { recursive: true });
   writeFileSync(taskArtifact, fullTask, "utf8");
@@ -623,7 +674,7 @@ async function runSubagentInPane(spec: ChildSpec): Promise<ChildOutcome> {
 
   let systemPromptTempDir: string | undefined;
   if (persona?.systemPrompt) {
-    systemPromptTempDir = mkdtempSync(join(tmpdir(), "jacek-bridge-"));
+    systemPromptTempDir = mkdtempSync(join(tmpdir(), "cohort-bridge-"));
     const promptPath = join(systemPromptTempDir, "system-prompt.md");
     writeFileSync(promptPath, persona.systemPrompt, "utf8");
     parts.push(persona.systemPromptMode === "replace" ? "--system-prompt" : "--append-system-prompt", shellEscape(promptPath));
@@ -677,6 +728,7 @@ async function runSubagentInPane(spec: ChildSpec): Promise<ChildOutcome> {
 
   const launchScript = join(artifactDir, "launch.sh");
 
+  const outputBefore = snapshotOutput(spec.outputPath);
   const abort = new AbortController();
   try {
     sendLongCommand(surface, command, {
@@ -704,6 +756,21 @@ async function runSubagentInPane(spec: ChildSpec): Promise<ChildOutcome> {
     closeSurface(surface);
     if (systemPromptTempDir) rmSync(systemPromptTempDir, { recursive: true, force: true });
 
+    // Honor `output` only on success -- a failed child's summary is error
+    // context, not findings, and must not overwrite the promised file.
+    let savedOutputPath: string | undefined;
+    if (result.exitCode === 0 && !result.errorMessage && spec.outputPath) {
+      const resolved = resolveOutputAfterRun(spec.outputPath, outputBefore, summary);
+      savedOutputPath = resolved.savedPath;
+      if (resolved.referenceMessage) {
+        summary = spec.outputMode === "file-only"
+          ? resolved.referenceMessage
+          : `${summary}\n\n${resolved.referenceMessage}`;
+      } else if (resolved.saveError) {
+        summary = `${summary}\n\nOutput file error: ${spec.outputPath}\n${resolved.saveError}`;
+      }
+    }
+
     return {
       name,
       agent: spec.agent,
@@ -713,6 +780,7 @@ async function runSubagentInPane(spec: ChildSpec): Promise<ChildOutcome> {
       summary,
       sessionFile,
       errorMessage: result.errorMessage,
+      savedOutputPath,
     };
   } catch (err: unknown) {
     try { closeSurface(surface); } catch {}

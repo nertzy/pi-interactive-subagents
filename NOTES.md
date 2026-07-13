@@ -45,5 +45,5 @@ it).
 `send`/`ask` accept the 8-char prefix `list` displays (unique-prefix match, fail
 on ambiguity). (a) is the smaller, less surprising fix. Until then, callers
 should prefer name-addressing and treat the `list` ID as display-only.
-Recorded here because it surfaced alongside the jacek-bridge result-delivery
+Recorded here because it surfaced alongside the cohort-bridge result-delivery
 work and shares the "delivery across sessions is flaky" theme.

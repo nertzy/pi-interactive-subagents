@@ -501,11 +501,11 @@ The sub-agent status supervision and turn-only interruption features were inspir
 
 MIT
 
-## Using alongside pi-subagents (Jacek's)
+## Using alongside pi-cohort (Jacek's, formerly pi-subagents)
 
-If your project pins [jjuraszek/pi-subagents](https://github.com/jjuraszek/pi-subagents) as a team contract, you can't install this package normally — both register a tool named `subagent` and pi will error on the collision.
+If your project pins [jjuraszek/pi-subagents](https://github.com/jjuraszek/pi-subagents) (published as `pi-cohort`) as a team contract, you can't install this package normally — both register a tool named `subagent` and pi will error on the collision.
 
-Instead, use the bridge extension in `pi-extension/jacek-bridge.ts`. It intercepts Jacek's `subagent` tool calls and re-dispatches them through this package's cmux machinery — single calls spawn in panes and steer back; chain/parallel calls fall through to Jacek's implementation unchanged.
+Instead, use the bridge extension in `pi-extension/cohort-bridge.ts`. It intercepts pi-cohort's `subagent` tool calls and re-dispatches them through this package's cmux machinery — single and parallel calls spawn in panes (one per child) and steer results back, honoring per-call/per-task `output` files; chain calls, and calls using semantics a pane can't reproduce (worktree, acceptance, fork context, structured output, skill/reads overrides), fall through to pi-cohort's implementation unchanged.
 
 **Setup:**
 
@@ -520,26 +520,28 @@ It creates all the necessary symlinks in `~/.pi/agent/extensions/` and is safe t
 Or manually:
 
 1. Do NOT `pi install` this package.
-2. Keep pi-subagents installed at project or user scope.
+2. Keep pi-cohort installed at project or user scope.
 3. Symlink the bridge and its helper modules into your user extensions:
 
    ```bash
    PKG=~/.pi/agent/git/github.com/nertzy/pi-interactive-subagents/pi-extension
    EXT=~/.pi/agent/extensions
 
-   ln -s "$PKG/jacek-bridge.ts" "$EXT/jacek-bridge.ts"
+   ln -s "$PKG/cohort-bridge.ts" "$EXT/cohort-bridge.ts"
 
    mkdir -p "$EXT/subagents"
-   ln -s "$PKG/subagents/cmux.ts"          "$EXT/subagents/cmux.ts"
-   ln -s "$PKG/subagents/session.ts"       "$EXT/subagents/session.ts"
-   ln -s "$PKG/subagents/activity.ts"      "$EXT/subagents/activity.ts"
-   ln -s "$PKG/subagents/subagent-done.ts" "$EXT/subagents/subagent-done.ts"
+   ln -s "$PKG/subagents/cmux.ts"            "$EXT/subagents/cmux.ts"
+   ln -s "$PKG/subagents/session.ts"         "$EXT/subagents/session.ts"
+   ln -s "$PKG/subagents/activity.ts"        "$EXT/subagents/activity.ts"
+   ln -s "$PKG/subagents/subagent-done.ts"   "$EXT/subagents/subagent-done.ts"
+   ln -s "$PKG/subagents/persona-resolve.ts" "$EXT/subagents/persona-resolve.ts"
+   ln -s "$PKG/subagents/output.ts"          "$EXT/subagents/output.ts"
    ```
 
    > **Why not symlink the whole `subagents/` directory?** pi's extension
    > discovery treats any subdirectory with an `index.ts` as an extension.
    > `subagents/index.ts` registers its own `subagent` tool, which collides
-   > with pi-subagents. A real directory with only the needed file symlinks
+   > with pi-cohort. A real directory with only the needed file symlinks
    > sidesteps the collision.
 
 4. Set the mux backend in your shell (e.g. `~/.config/fish/conf.d/pi-subagents.fish`):
@@ -548,4 +550,4 @@ Or manually:
    ```
 5. `/reload` in pi.
 
-Single `subagent(...)` calls will now open a new cmux pane and steer results back asynchronously. Chain/parallel calls fall through to Jacek's implementation unchanged.
+Single and parallel `subagent(...)` calls will now open cmux panes and steer results back asynchronously. Chain calls (and unsupported shapes) fall through to pi-cohort's implementation unchanged.
