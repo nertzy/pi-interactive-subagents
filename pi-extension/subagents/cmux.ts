@@ -41,7 +41,7 @@ function hasCommand(command: string): boolean {
   return available;
 }
 
-function muxPreference(): MuxBackend | null {
+export function muxPreference(): MuxBackend | null {
   const pref = (process.env.PI_SUBAGENT_MUX ?? "").trim().toLowerCase();
   if (pref === "cmux" || pref === "tmux" || pref === "zellij" || pref === "wezterm") return pref;
   return null;

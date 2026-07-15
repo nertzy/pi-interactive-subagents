@@ -551,3 +551,5 @@ Or manually:
 5. `/reload` in pi.
 
 Single and parallel `subagent(...)` calls will now open cmux panes and steer results back asynchronously. Chain calls (and unsupported shapes) fall through to pi-cohort's implementation unchanged.
+
+The bridge reflects its state in pi's footer status line rather than logging on every boot: `● cohort-bridge: cmux` when active, `● cohort-bridge: mux unavailable` when `PI_SUBAGENT_MUX` is set but no mux is running, and nothing when no mux was requested. It only writes to stderr in that misconfiguration case (mux wanted but unavailable) — never on the happy path.

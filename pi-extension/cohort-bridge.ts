@@ -58,6 +58,7 @@ import { fileURLToPath } from "node:url";
 import {
   isMuxAvailable,
   getMuxBackend,
+  muxPreference,
   muxSetupHint,
   createSurface,
   sendLongCommand,
@@ -395,16 +396,44 @@ interface ChildOutcome {
 }
 
 export default function (pi: ExtensionAPI) {
-  // One-time startup signal: this extension only loads when pi starts, so a
-  // session already running when PI_SUBAGENT_MUX is set or the mux terminal
-  // changes underneath it will silently keep using whatever was true at
-  // load time, with no other visible sign why panes aren't appearing.
+  // Snapshot the mux state once at load. This extension only loads at pi
+  // startup, so a session already running when PI_SUBAGENT_MUX is set (or the
+  // mux terminal changes underneath it) keeps whatever was true at load time;
+  // re-evaluating per session_start wouldn't reflect a mid-session change.
   const activeBackend = getMuxBackend();
-  if (activeBackend) {
-    console.error(`[cohort-bridge] active: routing subagent calls to ${activeBackend} panes.`);
-  } else {
-    console.error(`[cohort-bridge] inactive (${muxSetupHint()}); subagent calls fall through to pi-cohort's native executor.`);
+  const muxWanted = muxPreference() !== null;
+
+  // Load-time stderr is reserved for an actual misconfiguration: a mux backend
+  // was explicitly requested but isn't available, so subagent calls silently
+  // fall through to pi-cohort with no other sign why panes aren't appearing.
+  // The ordinary active/inactive state lives in the footer status line (see the
+  // session_start handler below), not as stderr noise on every boot.
+  if (!activeBackend && muxWanted) {
+    console.error(
+      `[cohort-bridge] PI_SUBAGENT_MUX is set but no mux is available; subagent calls fall through to pi-cohort. ${muxSetupHint()}`,
+    );
   }
+
+  // Surface the bridge's state in the footer status line -- glanceable and
+  // always current, unlike a one-shot boot message. Re-applied on every
+  // session_start so /new or a session switch keeps it. setStatus is a
+  // fire-and-forget no-op outside interactive/RPC modes.
+  pi.on("session_start", async (_event, ctx) => {
+    const { theme } = ctx.ui;
+    if (activeBackend) {
+      ctx.ui.setStatus(
+        "cohort-bridge",
+        `${theme.fg("success", "\u25cf")}${theme.fg("dim", ` cohort-bridge: ${activeBackend}`)}`,
+      );
+    } else if (muxWanted) {
+      ctx.ui.setStatus(
+        "cohort-bridge",
+        `${theme.fg("warning", "\u25cf")}${theme.fg("dim", " cohort-bridge: mux unavailable")}`,
+      );
+    } else {
+      ctx.ui.setStatus("cohort-bridge", undefined);
+    }
+  });
 
   pi.on("tool_call", async (event, ctx) => {
     if (event.toolName !== "subagent") return;
