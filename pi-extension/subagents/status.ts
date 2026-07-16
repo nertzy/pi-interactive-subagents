@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { readFileSync, realpathSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -7,7 +7,11 @@ export const DEFAULT_STATUS_LINE_LIMIT = 4;
 export const MAX_STATUS_NAME_LENGTH = 72;
 export const MAX_STATUS_LINE_LENGTH = 120;
 
-const PACKAGE_ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
+// realpathSync resolves the module's own path before deriving the package
+// root: pi loads this extension through a per-agent symlink, and
+// import.meta.url reflects the unresolved symlink path, so a bare "../.."
+// would land in the agent dir instead of the package root.
+const PACKAGE_ROOT = join(dirname(realpathSync(fileURLToPath(import.meta.url))), "../..");
 const DEFAULT_STATUS_CONFIG_PATH = join(PACKAGE_ROOT, "config.json");
 const STATUS_CONFIG_EXAMPLE_PATH = join(PACKAGE_ROOT, "config.json.example");
 

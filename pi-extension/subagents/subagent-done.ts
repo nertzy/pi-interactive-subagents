@@ -6,9 +6,16 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Box, Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+
+// realpathSync resolves the module's own path before deriving the package
+// root: pi loads this extension through a per-agent symlink (e.g.
+// ~/.pi/agent.anthropic/extensions/...), and import.meta.url reflects the
+// unresolved symlink path, so a bare "../.." would land in the agent dir
+// instead of the package root and fail to find config.json.example.
+const MODULE_DIR = dirname(realpathSync(fileURLToPath(import.meta.url)));
 import { createSubagentActivityRecorder } from "./activity.ts";
 
 export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
@@ -112,8 +119,8 @@ function formatShortcut(shortcut: string): string {
 }
 
 export function loadSubagentDoneKeybindings(
-  configPath = join(dirname(fileURLToPath(import.meta.url)), "../..", "config.json"),
-  examplePath = join(dirname(fileURLToPath(import.meta.url)), "../..", "config.json.example"),
+  configPath = join(MODULE_DIR, "../..", "config.json"),
+  examplePath = join(MODULE_DIR, "../..", "config.json.example"),
 ): SubagentDoneKeybindings {
   let rawConfig: string;
   try {
