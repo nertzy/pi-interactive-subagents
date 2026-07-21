@@ -446,8 +446,12 @@ export default function (pi: ExtensionAPI) {
     if (params.worktree || params.acceptance || params.context === "fork") return;
     if (params.skill !== undefined && params.skill !== false) return;
 
-    // Require cmux to be available; fall through to pi-cohort if not.
+    // Require a mux to be available; fall through to pi-cohort if not.
     if (!isMuxAvailable()) return;
+
+    // Backend actually chosen for this dispatch (cmux/tmux/zellij/wezterm),
+    // used to label user-facing reason messages accurately.
+    const mux = getMuxBackend() ?? "mux";
 
     const runId = Math.random().toString(16).slice(2, 10);
     const orchestratorTarget = resolveIntercomSessionTarget(
@@ -467,7 +471,7 @@ export default function (pi: ExtensionAPI) {
       void dispatchParallel(pi, ctx, specs, concurrency);
       return {
         block: true,
-        reason: `Rerouted ${specs.length} parallel subagent(s) to cmux panes (cohort-bridge). Aggregate result will be delivered as a steer message.`,
+        reason: `Rerouted ${specs.length} parallel subagent(s) to ${mux} panes (cohort-bridge). Aggregate result will be delivered as a steer message.`,
       };
     }
 
@@ -503,7 +507,7 @@ export default function (pi: ExtensionAPI) {
     void dispatchSingle(pi, ctx, spec);
     return {
       block: true,
-      reason: `Rerouted to cmux pane (cohort-bridge). Result will be delivered as a steer message.`,
+      reason: `Rerouted to ${mux} pane (cohort-bridge). Result will be delivered as a steer message.`,
     };
   });
 }
