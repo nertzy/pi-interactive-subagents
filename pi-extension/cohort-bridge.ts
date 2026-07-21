@@ -740,6 +740,12 @@ async function runSubagentInPane(spec: ChildSpec): Promise<ChildOutcome> {
     // it just selects the right settings.json (model map, defaultModel,
     // packages) so the child resolves the same model the parent would.
     `PI_CODING_AGENT_DIR=${shellEscape(AGENT_DIR)}`,
+    // Mark the pane child as a real subagent, mirroring pi-cohort's native
+    // getSubagentDepthEnv (parent depth + 1). Without this the child looks
+    // top-level and its user-scope baton extensions (ticket-baton, here-baton,
+    // presence, cmux-workspace-title) all initialize and clobber the parent's
+    // shared workspace pill/title, since the pane inherits CMUX_WORKSPACE_ID.
+    `PI_SUBAGENT_DEPTH=${(Number(process.env.PI_SUBAGENT_DEPTH ?? "0") || 0) + 1}`,
   ];
   if (spec.agent) envParts.push(`PI_SUBAGENT_AGENT=${shellEscape(spec.agent)}`);
   if (persona && runtimeExtPath) {
