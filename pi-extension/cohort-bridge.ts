@@ -50,7 +50,7 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -103,14 +103,56 @@ const SUBAGENT_DONE_EXTENSION = join(MODULE_DIR, "subagents", "subagent-done.ts"
 
 // The active preset's agent dir (respects PI_CODING_AGENT_DIR), not a
 // hardcoded ~/.pi/agent. A cmux pane starts a fresh login shell that does NOT
-// inherit the parent pi's environment, so children must be pinned to this dir
-// explicitly (see PI_CODING_AGENT_DIR in the launch env below); otherwise a
-// pi launched under a preset (e.g. ~/.pi/agent.anthropic) would silently spawn
-// children under the default dir with a different settings.json -- wrong model
-// map, wrong defaultModel, missing packages -- so its subagents pick up the
-// wrong model.
+// inherit the parent pi's environment. Known presets therefore launch through
+// their fish functions, which select the matching agent directory and inject
+// runtime credentials. Unknown directories retain raw pi with an explicit
+// PI_CODING_AGENT_DIR so their settings still match the parent.
 const AGENT_DIR = getAgentDir();
 const DEFAULT_PARALLEL_CONCURRENCY = 4;
+
+const PRESET_LAUNCHERS: ReadonlyArray<readonly [string, string]> = [
+  ["agent.non-zdr", "pi-non-zdr"],
+  ["agent.zdr", "pi-zdr"],
+  ["agent.local", "pi-local"],
+];
+
+function resolvePresetLauncher(agentDir: string): string | undefined {
+  let canonicalAgentDir: string;
+  try {
+    canonicalAgentDir = realpathSync(agentDir);
+  } catch {
+    return undefined;
+  }
+
+  for (const [presetDir, launcher] of PRESET_LAUNCHERS) {
+    try {
+      if (canonicalAgentDir === realpathSync(join(homedir(), ".pi", presetDir))) {
+        return launcher;
+      }
+    } catch {
+      // A missing preset directory cannot identify the active agent directory.
+    }
+  }
+
+  return undefined;
+}
+
+function buildPanePiCommand(agentDir: string, args: string[]): string {
+  const escapedArgs = args.map(shellEscape).join(" ");
+  const argSuffix = escapedArgs ? ` ${escapedArgs}` : "";
+  const launcher = resolvePresetLauncher(agentDir);
+
+  if (!launcher) {
+    return `PI_CODING_AGENT_DIR=${shellEscape(agentDir)} pi${argSuffix}`;
+  }
+
+  const fishCommand =
+    `if functions -q ${launcher}; ${launcher} $argv[2..-1]; ` +
+    `else; echo 'cohort-bridge: preset launcher ${launcher} is unavailable' >&2; ` +
+    `exit 127; end`;
+  const positionalArgs = [agentDir, ...args].map(shellEscape).join(" ");
+  return `fish -lc ${shellEscape(fishCommand)} -- ${positionalArgs}`;
+}
 
 // Wall-clock stamp of when this pi session booted (the extension module is
 // evaluated once at pi startup). A pane whose cwd was born after this is a
@@ -130,7 +172,9 @@ const SESSION_START_MS = Date.now();
 // on-disk shape (canonical-path keys, sorted, trailing newline); the child pane
 // is pinned to that preset dir via PI_CODING_AGENT_DIR, so it is the file it
 // reads. Atomic temp+rename keeps a concurrent reader from seeing a partial
-// file. Takes effect on the next pi start (extensions load once at boot).
+// file. The pane child selects the same preset through its fish launcher or an
+// explicit PI_CODING_AGENT_DIR. Takes effect on the next pi start (extensions
+// load once at boot).
 function maybeTrustSessionCwd(cwd: string): void {
   let canonical: string;
   let birthMs: number;
@@ -293,7 +337,9 @@ function deliverResult(pi: ExtensionAPI, ctx: ExtensionContext, entry: PendingRe
 // Module-level pendingResults/resultFlushTimer/firstDeferredAt are process-wide
 // singletons; tests must reset between cases via resetForTest().
 export const __test__ = {
+  buildPanePiCommand,
   deliverResult,
+  resolvePresetLauncher,
   setOrphanSink(sink: OrphanSink): void {
     orphanSink = sink;
   },
@@ -685,36 +731,36 @@ async function runSubagentInPane(spec: ChildSpec): Promise<ChildOutcome> {
   // Let the shell start up before sending the command
   await new Promise<void>((resolve) => setTimeout(resolve, 500));
 
-  // Build pi launch command
-  const parts: string[] = ["pi"];
-  parts.push("--session", shellEscape(sessionFile));
+  // Build pi launch arguments
+  const parts: string[] = [];
+  parts.push("--session", sessionFile);
   // Load HazAT's subagent-done extension so the child can call subagent_done
-  parts.push("-e", shellEscape(SUBAGENT_DONE_EXTENSION));
+  parts.push("-e", SUBAGENT_DONE_EXTENSION);
 
   // Additively load pi-subagents' own prompt-runtime extension when we can
   // find it, so inheritProjectContext/inheritSkills are honored the same way
   // native (non-cmux) children get them. Best-effort: fails open (child sees
   // full inherited context) rather than blocking cmux dispatch entirely.
   const runtimeExtPath = persona ? findSubagentsRuntimeExtension(cwd) : undefined;
-  if (runtimeExtPath) parts.push("-e", shellEscape(runtimeExtPath));
+  if (runtimeExtPath) parts.push("-e", runtimeExtPath);
 
   const resolvedModel = spec.model ?? persona?.model;
   const modelArg = applyThinkingSuffix(resolvedModel, persona?.thinking);
-  if (modelArg) parts.push("--model", shellEscape(modelArg));
+  if (modelArg) parts.push("--model", modelArg);
 
   if (persona && !persona.inheritSkills) parts.push("--no-skills");
-  if (persona?.tools?.length) parts.push("--tools", shellEscape(persona.tools.join(",")));
+  if (persona?.tools?.length) parts.push("--tools", persona.tools.join(","));
 
   let systemPromptTempDir: string | undefined;
   if (persona?.systemPrompt) {
     systemPromptTempDir = mkdtempSync(join(tmpdir(), "cohort-bridge-"));
     const promptPath = join(systemPromptTempDir, "system-prompt.md");
     writeFileSync(promptPath, persona.systemPrompt, "utf8");
-    parts.push(persona.systemPromptMode === "replace" ? "--system-prompt" : "--append-system-prompt", shellEscape(promptPath));
+    parts.push(persona.systemPromptMode === "replace" ? "--system-prompt" : "--append-system-prompt", promptPath);
   }
 
   // Task delivered via @file
-  parts.push(shellEscape(`@${taskArtifact}`));
+  parts.push(`@${taskArtifact}`);
 
   const agentLabel = spec.agent ?? name;
   const intercomSessionName = resolveSubagentIntercomTarget(runId, agentLabel, index);
@@ -735,11 +781,6 @@ async function runSubagentInPane(spec: ChildSpec): Promise<ChildOutcome> {
     `PI_SUBAGENT_CHILD_AGENT=${shellEscape(agentLabel)}`,
     `PI_SUBAGENT_CHILD_INDEX=${index}`,
     `PI_SUBAGENT_INTERCOM_SESSION_NAME=${shellEscape(intercomSessionName)}`,
-    // Pin the child to the parent's preset dir. Auth is shared (each preset's
-    // auth.json is the same file/symlink), so this needs no secret on disk --
-    // it just selects the right settings.json (model map, defaultModel,
-    // packages) so the child resolves the same model the parent would.
-    `PI_CODING_AGENT_DIR=${shellEscape(AGENT_DIR)}`,
     // Mark the pane child as a real subagent, mirroring pi-cohort's native
     // getSubagentDepthEnv (parent depth + 1). Without this the child looks
     // top-level and its user-scope baton extensions (ticket-baton, here-baton,
@@ -763,7 +804,8 @@ async function runSubagentInPane(spec: ChildSpec): Promise<ChildOutcome> {
   // parent's alone.
   const stripGhosttyIdent =
     "env -u TERM_PROGRAM -u GHOSTTY_RESOURCES_DIR -u GHOSTTY_BIN_DIR ";
-  const command = `${cdPrefix}${envParts.join(" ")} ${stripGhosttyIdent}${parts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
+  const piCommand = buildPanePiCommand(AGENT_DIR, parts);
+  const command = `${cdPrefix}${envParts.join(" ")} ${stripGhosttyIdent}${piCommand}; echo '__SUBAGENT_DONE_'$?'__'`;
 
   const launchScript = join(artifactDir, "launch.sh");
 
