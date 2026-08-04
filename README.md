@@ -568,3 +568,31 @@ Or manually:
 Single and parallel `subagent(...)` calls will now open cmux panes and steer results back asynchronously. Chain calls (and unsupported shapes) fall through to pi-cohort's implementation unchanged.
 
 The bridge reflects its state in pi's footer status line rather than logging on every boot: `● cohort-bridge: cmux` when active, `● cohort-bridge: mux unavailable` when `PI_SUBAGENT_MUX` is set but no mux is running, and nothing when no mux was requested. It only writes to stderr in that misconfiguration case (mux wanted but unavailable) — never on the happy path.
+
+### Preset launchers
+
+For every supported pane backend, the bridge reserves three canonical agent
+directory paths under the current user's home and maps each one to a
+corresponding user-defined Fish function:
+
+- `~/.pi/agent.non-zdr` uses `pi-non-zdr`
+- `~/.pi/agent.zdr` uses `pi-zdr`
+- `~/.pi/agent.local` uses `pi-local`
+
+The bridge compares canonical paths, so a symlink that resolves to one of these
+reserved paths uses the same mapping. The corresponding function must be
+available to `fish -lc`; the bridge invokes it with the pi arguments passed
+positionally. For this preset handoff, the bridge serializes the launcher
+invocation and positional arguments, never resolved credential values, into the
+generated `launch.sh` artifact. Launcher implementation and credential handling
+are user-managed and outside this package.
+
+Any agent directory that does not canonically match a reserved path, including
+a custom directory with the same basename, uses raw `pi` with
+`PI_CODING_AGENT_DIR` set explicitly. If Fish cannot start or the mapped
+function is unavailable, the reserved-path launch fails loudly rather than
+falling back to raw `pi`.
+
+Fish is required to run the preset-launch smoke tests in
+`test/cohort-bridge-pane-launch.test.ts`; the package's `npm test` command
+includes this test file.
