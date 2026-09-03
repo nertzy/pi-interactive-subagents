@@ -1,11 +1,15 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { visibleWidth } from "@mariozechner/pi-tui";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
+import {
+  isPermanentModelOrAuthFailure,
+  redactCredentialValues,
+} from "../pi-extension/subagents/model-failure.ts";
 
 import {
   getLeafId,
@@ -55,7 +59,14 @@ import {
   findLatestAssistantError,
   createSubagentDoneExtension,
 } from "../pi-extension/subagents/subagent-done.ts";
+import { shouldRegisterLegacySubagentsExtension } from "../pi-extension/subagents/index.ts";
 import { __pollForExitTest__ } from "../pi-extension/subagents/cmux.ts";
+
+// This file exercises the legacy parent extension by default even when the
+// test runner itself happens to be launched from a nested subagent session.
+const originalSubagentDepth = process.env.PI_SUBAGENT_DEPTH;
+before(() => { delete process.env.PI_SUBAGENT_DEPTH; });
+after(() => { restoreEnvVar("PI_SUBAGENT_DEPTH", originalSubagentDepth); });
 
 // --- Helpers ---
 
@@ -1217,6 +1228,96 @@ describe("subagent discovery", () => {
     });
   });
 });
+describe("model-failure.ts", () => {
+  const permanentCases: Array<[string, unknown]> = [
+    ["missing Anthropic API key", new Error('No API key found for "anthropic"')],
+    ["401 invalid key", { status: 401, error: { message: "invalid x-api-key" } }],
+    ["401 in Anthropic error text", "Anthropic API error: 401 invalid x-api-key"],
+    ["403 in HTTP error text", "HTTP 403 Forbidden"],
+    ["401 in provider status text", "Provider request failed with status 401: invalid x-api-key"],
+    ["403 model access denied", { statusCode: 403, message: "Access denied to model" }],
+    ["model not found", { errorMessage: "The requested model was not found" }],
+    ["provided model identifier invalid", "Provided model identifier is invalid"],
+  ];
+
+  for (const [name, failure] of permanentCases) {
+    it(`classifies ${name} as permanent`, () => {
+      assert.equal(isPermanentModelOrAuthFailure(failure), true);
+    });
+  }
+
+  const nonPermanentCases: Array<[string, unknown]> = [
+    ["429 throttling", { status: 429, message: "rate limited" }],
+    ["529 overload", { status: 529, message: "overloaded" }],
+    ["textual 429 with auth-like detail", "HTTP 429 invalid x-api-key"],
+    ["textual 500 with auth-like detail", "HTTP 500 invalid x-api-key"],
+    ["fetch failure", new Error("fetch failed")],
+    ["stream serialization failure", new Error("failed to serialize stream chunk")],
+    ["user abort", { name: "AbortError", message: "The user aborted a request" }],
+    ["401 embedded in an unrelated value", "request id abc401xyz failed"],
+    ["403 embedded in a larger number", "request id 14031 failed"],
+  ];
+
+  for (const [name, failure] of nonPermanentCases) {
+    it(`does not classify ${name} as permanent`, () => {
+      assert.equal(isPermanentModelOrAuthFailure(failure), false);
+    });
+  }
+
+  it("redacts credential-bearing values while retaining failure context", () => {
+    const sentinel = "credential-sentinel-1234567890";
+    const original = [
+      "Anthropic model claude-test returned HTTP 401",
+      `x-api-key: ${sentinel}`,
+      `api_key=${sentinel}`,
+      `api-key: ${sentinel}`,
+      `Authorization: Bearer ${sentinel}`,
+      `Authorization=Basic ${sentinel}`,
+      `token=${sentinel}`,
+      `"access_token":"${sentinel}"`,
+      "raw key sk-ant-api03-abcdefghijklmnopqrstuvwxyz",
+    ].join("; ");
+    const redacted = redactCredentialValues(original);
+
+    assert.match(redacted, /Anthropic model claude-test returned HTTP 401/);
+    assert.doesNotMatch(redacted, new RegExp(sentinel));
+    assert.doesNotMatch(redacted, /sk-ant-api03-abcdefghijklmnopqrstuvwxyz/);
+    assert.match(redacted, /x-api-key: \[REDACTED\]/);
+    assert.match(redacted, /Authorization: Bearer \[REDACTED\]/);
+  });
+});
+
+describe("legacy subagent extension registration", () => {
+  for (const depth of [undefined, "0"] as const) {
+    it(`registers at depth ${String(depth)}`, () => {
+      assert.equal(shouldRegisterLegacySubagentsExtension(depth), true);
+    });
+  }
+
+  for (const depth of ["1", "2"] as const) {
+    it(`skips all registration at nested depth ${depth}`, () => {
+      assert.equal(shouldRegisterLegacySubagentsExtension(depth), false);
+    });
+  }
+
+  it("returns before registering any extension surface in a nested child", () => {
+    const previousDepth = process.env.PI_SUBAGENT_DEPTH;
+    process.env.PI_SUBAGENT_DEPTH = "1";
+    try {
+      const calls: string[] = [];
+      (subagentsModule as any).default(new Proxy({}, {
+        get(_target, property) {
+          calls.push(String(property));
+          return () => {};
+        },
+      }));
+      assert.deepEqual(calls, []);
+    } finally {
+      restoreEnvVar("PI_SUBAGENT_DEPTH", previousDepth);
+    }
+  });
+});
+
 describe("subagent-done.ts", () => {
   describe("shouldMarkUserTookOver", () => {
     it("ignores the initial injected task before the first agent run", () => {
@@ -1242,6 +1343,25 @@ describe("subagent-done.ts", () => {
     it("stays open after Escape aborts the run", () => {
       const messages = [{ role: "assistant", stopReason: "aborted" }];
       assert.equal(shouldAutoExitOnAgentEnd(false, messages), false);
+    });
+
+    it("auto-exits an aborted unavailable-model failure", () => {
+      const messages = [{
+        role: "assistant",
+        stopReason: "aborted",
+        errorMessage: "The requested model was not found",
+      }];
+      assert.equal(shouldAutoExitOnAgentEnd(false, messages), true);
+    });
+
+    it("auto-exits an aborted 401 failure", () => {
+      const messages = [{ role: "assistant", stopReason: "aborted", errorMessage: "401 invalid API key" }];
+      assert.equal(shouldAutoExitOnAgentEnd(false, messages), true);
+    });
+
+    it("keeps a taken-over session open after an aborted permanent failure", () => {
+      const messages = [{ role: "assistant", stopReason: "aborted", errorMessage: "model not found" }];
+      assert.equal(shouldAutoExitOnAgentEnd(true, messages), false);
     });
 
     it("still exits when the latest turn ended with stopReason=error", () => {
@@ -1280,6 +1400,22 @@ describe("subagent-done.ts", () => {
       assert.equal(findLatestAssistantError(messages), null);
     });
 
+    it("returns error info for an aborted permanent model failure", () => {
+      const messages = [{ role: "assistant", stopReason: "aborted", errorMessage: "model not found" }];
+      assert.deepEqual(findLatestAssistantError(messages), {
+        errorMessage: "model not found",
+        stopReason: "error",
+      });
+    });
+
+    it("returns error info for an aborted authentication failure", () => {
+      const messages = [{ role: "assistant", stopReason: "aborted", errorMessage: "401 invalid API key" }];
+      assert.deepEqual(findLatestAssistantError(messages), {
+        errorMessage: "401 invalid API key",
+        stopReason: "error",
+      });
+    });
+
     it("falls back to a placeholder when stopReason=error has no errorMessage field", () => {
       const messages = [{ role: "assistant", stopReason: "error" }];
       const info = findLatestAssistantError(messages);
@@ -1292,6 +1428,237 @@ describe("subagent-done.ts", () => {
       assert.equal(findLatestAssistantError(undefined), null);
       assert.equal(findLatestAssistantError([]), null);
     });
+  });
+
+  describe("autonomous lifecycle", () => {
+    function installLifecycle(autoExit: boolean) {
+      const handlers = new Map<string, any>();
+      const previousAutoExit = process.env.PI_SUBAGENT_AUTO_EXIT;
+      if (autoExit) process.env.PI_SUBAGENT_AUTO_EXIT = "1";
+      else delete process.env.PI_SUBAGENT_AUTO_EXIT;
+      createSubagentDoneExtension()({
+        on(event: string, handler: any) { handlers.set(event, handler); },
+        getAllTools() { return []; },
+        registerShortcut() {},
+        registerTool() {},
+      } as any);
+      restoreEnvVar("PI_SUBAGENT_AUTO_EXIT", previousAutoExit);
+      return handlers;
+    }
+
+    it("handles missing auth on initial autonomous input and records terminal state", async () => {
+      const dir = createTestDir();
+      const sessionFile = join(dir, "session.jsonl");
+      const activityFile = join(dir, "activity.json");
+      const previousSession = process.env.PI_SUBAGENT_SESSION;
+      const previousActivityFile = process.env.PI_SUBAGENT_ACTIVITY_FILE;
+      const previousChildId = process.env.PI_SUBAGENT_ID;
+      process.env.PI_SUBAGENT_SESSION = sessionFile;
+      process.env.PI_SUBAGENT_ACTIVITY_FILE = activityFile;
+      process.env.PI_SUBAGENT_ID = "child-auth-test";
+      try {
+        const handlers = installLifecycle(true);
+        let shutdowns = 0;
+        let resolverCalls = 0;
+        const result = await handlers.get("input")({}, {
+          model: { provider: "anthropic", id: "test-model" },
+          modelRegistry: {
+            hasConfiguredAuth() { return false; },
+            async getApiKeyAndHeaders() {
+              resolverCalls += 1;
+              return { ok: true, apiKey: undefined };
+            },
+          },
+          shutdown() { shutdowns += 1; },
+        });
+
+        assert.deepEqual(result, { action: "handled" });
+        assert.equal(shutdowns, 1);
+        assert.equal(resolverCalls, 0);
+        assert.deepEqual(JSON.parse(readFileSync(`${sessionFile}.exit`, "utf8")), {
+          type: "error",
+          errorMessage: 'No API key found for provider "anthropic".',
+          stopReason: "error",
+        });
+        const activity = JSON.parse(readFileSync(activityFile, "utf8"));
+        assert.equal(activity.phase, "done");
+        assert.equal(activity.latestEvent, "agent_end");
+      } finally {
+        restoreEnvVar("PI_SUBAGENT_SESSION", previousSession);
+        restoreEnvVar("PI_SUBAGENT_ACTIVITY_FILE", previousActivityFile);
+        restoreEnvVar("PI_SUBAGENT_ID", previousChildId);
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("continues after successful auth without reading credential fields", async () => {
+      const handlers = installLifecycle(true);
+      const auth = Object.defineProperties({ ok: true }, {
+        apiKey: { get() { throw new Error("apiKey must not be read"); } },
+        headers: { get() { throw new Error("headers must not be read"); } },
+        env: { get() { throw new Error("env must not be read"); } },
+      });
+      const result = await handlers.get("input")({}, {
+        model: { provider: "anthropic", id: "test-model" },
+        modelRegistry: {
+          hasConfiguredAuth() { return true; },
+          async getApiKeyAndHeaders() { return auth; },
+        },
+        shutdown() { throw new Error("successful auth must not shut down"); },
+      });
+
+      assert.deepEqual(result, { action: "continue" });
+    });
+
+    it("handles configured auth resolver failures", async () => {
+      const dir = createTestDir();
+      const previousSession = process.env.PI_SUBAGENT_SESSION;
+      process.env.PI_SUBAGENT_SESSION = join(dir, "session.jsonl");
+      try {
+        const handlers = installLifecycle(true);
+        let shutdowns = 0;
+        const result = await handlers.get("input")({}, {
+          model: { provider: "anthropic", id: "test-model" },
+          modelRegistry: {
+            hasConfiguredAuth() { return true; },
+            async getApiKeyAndHeaders() {
+              return { ok: false, error: "Anthropic credential resolver failed" };
+            },
+          },
+          shutdown() { shutdowns += 1; },
+        });
+
+        assert.deepEqual(result, { action: "handled" });
+        assert.equal(shutdowns, 1);
+        assert.deepEqual(JSON.parse(readFileSync(`${process.env.PI_SUBAGENT_SESSION}.exit`, "utf8")), {
+          type: "error",
+          errorMessage: "Anthropic credential resolver failed",
+          stopReason: "error",
+        });
+      } finally {
+        restoreEnvVar("PI_SUBAGENT_SESSION", previousSession);
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("redacts credentials from lifecycle error sidecars", () => {
+      const dir = createTestDir();
+      const previousSession = process.env.PI_SUBAGENT_SESSION;
+      process.env.PI_SUBAGENT_SESSION = join(dir, "session.jsonl");
+      try {
+        const handlers = installLifecycle(true);
+        const sentinel = "lifecycle-secret-sentinel-1234567890";
+        handlers.get("agent_end")({ messages: [{
+          role: "assistant",
+          stopReason: "error",
+          errorMessage: `Anthropic model claude-test HTTP 401 x-api-key: ${sentinel}`,
+        }] }, { shutdown() {} });
+        const sidecar = readFileSync(`${process.env.PI_SUBAGENT_SESSION}.exit`, "utf8");
+        assert.match(sidecar, /Anthropic model claude-test HTTP 401/);
+        assert.doesNotMatch(sidecar, new RegExp(sentinel));
+      } finally {
+        restoreEnvVar("PI_SUBAGENT_SESSION", previousSession);
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("skips auth preflight outside auto-exit sessions", async () => {
+      const handlers = installLifecycle(false);
+      const result = await handlers.get("input")({}, {
+        model: { provider: "anthropic", id: "test-model" },
+        modelRegistry: {
+          getApiKeyAndHeaders() { throw new Error("auth preflight must be skipped"); },
+        },
+      });
+
+      assert.deepEqual(result, { action: "continue" });
+    });
+
+    it("marks later input as takeover and continues without auth preflight", async () => {
+      const handlers = installLifecycle(true);
+      handlers.get("agent_start")();
+      const result = await handlers.get("input")({}, {
+        model: { provider: "anthropic", id: "test-model" },
+        modelRegistry: {
+          getApiKeyAndHeaders() { throw new Error("takeover must skip auth preflight"); },
+        },
+      });
+      let shutdowns = 0;
+      handlers.get("agent_end")({
+        messages: [{ role: "assistant", stopReason: "aborted", errorMessage: "model not found" }],
+      }, {
+        shutdown() { shutdowns += 1; },
+      });
+
+      assert.deepEqual(result, { action: "continue" });
+      assert.equal(shutdowns, 0);
+    });
+
+    const agentEndCases = [
+      {
+        name: "aborted unavailable model",
+        message: { role: "assistant", stopReason: "aborted", errorMessage: "model not found" },
+        takeover: false,
+        exits: true,
+      },
+      {
+        name: "aborted 401 authentication failure",
+        message: { role: "assistant", stopReason: "aborted", errorMessage: "401 invalid API key" },
+        takeover: false,
+        exits: true,
+      },
+      {
+        name: "plain user abort",
+        message: { role: "assistant", stopReason: "aborted" },
+        takeover: false,
+        exits: false,
+      },
+      {
+        name: "taken-over permanent failure",
+        message: { role: "assistant", stopReason: "aborted", errorMessage: "model not found" },
+        takeover: true,
+        exits: false,
+      },
+      {
+        name: "normal stopReason=error",
+        message: { role: "assistant", stopReason: "error", errorMessage: "529 overloaded" },
+        takeover: false,
+        exits: true,
+      },
+    ];
+
+    for (const lifecycleCase of agentEndCases) {
+      it(`${lifecycleCase.name} ${lifecycleCase.exits ? "exits with error info" : "stays open"}`, () => {
+        const dir = createTestDir();
+        const previousSession = process.env.PI_SUBAGENT_SESSION;
+        process.env.PI_SUBAGENT_SESSION = join(dir, "session.jsonl");
+        try {
+          const handlers = installLifecycle(true);
+          if (lifecycleCase.takeover) {
+            handlers.get("agent_start")();
+            handlers.get("input")();
+          }
+          let shutdowns = 0;
+          handlers.get("agent_end")({ messages: [lifecycleCase.message] }, {
+            shutdown() { shutdowns += 1; },
+          });
+          assert.equal(shutdowns, lifecycleCase.exits ? 1 : 0);
+          const sidecar = `${process.env.PI_SUBAGENT_SESSION}.exit`;
+          if (lifecycleCase.exits) {
+            assert.deepEqual(JSON.parse(readFileSync(sidecar, "utf8")), {
+              type: "error",
+              errorMessage: lifecycleCase.message.errorMessage,
+              stopReason: "error",
+            });
+          } else {
+            assert.equal(existsSync(sidecar), false);
+          }
+        } finally {
+          restoreEnvVar("PI_SUBAGENT_SESSION", previousSession);
+          rmSync(dir, { recursive: true, force: true });
+        }
+      });
+    }
   });
 });
 

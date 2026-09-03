@@ -13,7 +13,7 @@
   },
   "type": "module",
   "scripts": {
-    "test": "node --test test/test.ts test/cohort-bridge-coalescing.test.ts test/cohort-bridge-pane-launch.test.ts test/output.test.ts",
+    "test": "node --experimental-test-module-mocks --test test/test.ts test/cohort-bridge-acceptance.test.ts test/cohort-bridge-chain.test.ts test/cohort-bridge-coalescing.test.ts test/cohort-bridge-pane-launch.test.ts test/cohort-bridge-routing.test.ts test/cohort-bridge-status.test.ts test/cohort-bridge-worktree.test.ts test/output.test.ts",
     "test:integration": "node --test --test-concurrency=1 test/integration/*.test.ts"
   },
   "peerDependencies": {

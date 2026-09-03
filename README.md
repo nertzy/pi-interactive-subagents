@@ -2,7 +2,7 @@
 
 Async subagents for [pi](https://github.com/badlogic/pi-mono) — spawn, orchestrate, and manage sub-agent sessions in multiplexer panes. **Fully non-blocking** — the main agent keeps working while subagents run in the background.
 
-https://github.com/user-attachments/assets/30adb156-cfb4-4c47-84ca-dd4aa80cba9f
+<https://github.com/user-attachments/assets/30adb156-cfb4-4c47-84ca-dd4aa80cba9f>
 
 ## How It Works
 
@@ -203,15 +203,18 @@ This is a turn-level interrupt, not a method for forcibly terminating a subagent
 The `caller_ping` tool lets a subagent request help from its parent agent. When called, the child session **exits** and the parent receives a notification with the help message. The parent can then **resume** the child session with a response using `subagent_resume`.
 
 **`caller_ping` parameters:**
+
 - `message` (required): What you need help with
 
 **`subagent_resume` parameters:**
+
 - `sessionPath` (required): Path to the child session `.jsonl` file
 - `name` (optional): Display name for the resumed pane (defaults to `Resume`)
 - `message` (optional): Follow-up prompt to send after resuming
 - `autoExit` (optional): Whether the resumed session should auto-exit after its next response. Defaults to `true` for autonomous follow-up work; set `false` when resuming for an interactive handoff.
 
 **Interaction flow:**
+
 1. Child calls `caller_ping({ message: "Not sure which schema to use" })`
 2. Child session exits (like `subagent_done`)
 3. Parent receives a steer notification: *"Sub-agent Worker needs help: Not sure which schema to use"*
@@ -219,6 +222,7 @@ The `caller_ping` tool lets a subagent request help from its parent agent. When 
 5. Child picks up where it left off with the parent's guidance
 
 **Example:**
+
 ```typescript
 // Inside a worker subagent
 await caller_ping({
@@ -296,13 +300,14 @@ You are a specialized agent that does X...
 | `name`        | string  | Agent name (used in `agent: "my-agent"`)                                                                                                                                                                                                                                    |
 | `description` | string  | Shown in `subagents_list` output                                                                                                                                                                                                                                            |
 | `model`       | string  | Default model (e.g. `anthropic/claude-sonnet-4-6`)                                                                                                                                                                                                                          |
+| `fallbackModels` | string | Comma-separated fallback model IDs attempted in configured order after an eligible model/auth failure                                                                                                                                                                      |
 | `thinking`    | string  | Thinking level: `minimal`, `medium`, `high`                                                                                                                                                                                                                                 |
 | `tools`       | string  | Comma-separated **native pi tools only**: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`                                                                                                                                                                             |
 | `skills`      | string  | Comma-separated skill names to auto-load                                                                                                                                                                                                                                    |
 | `session-mode` | string | Default child-session mode: `standalone`, `lineage-only`, or `fork` |
 | `spawning`    | boolean | Set `false` to deny all subagent-spawning tools                                                                                                                                                                                                                             |
 | `deny-tools`  | string  | Comma-separated extension tool names to deny                                                                                                                                                                                                                                |
-| `auto-exit`   | boolean | Auto-shutdown when the agent finishes its turn — no `subagent_done` call needed. If the user sends any input, auto-exit is permanently disabled and the user takes over the session. Recommended for autonomous agents (scout, worker); not for interactive ones (planner). Also determines the default value of `interactive` (see below). |
+| `auto-exit`   | boolean | Auto-shutdown after the final message of a normally completed turn — no `subagent_done` call needed. Input after the agent starts marks a user takeover; takeover keeps an aborted turn open even if it contains otherwise-permanent failure evidence, while a normally completed taken-over turn still closes automatically. Recommended for autonomous agents (scout, worker); not for interactive ones (planner). Also determines the default value of `interactive` (see below). |
 | `interactive` | boolean | derived        | Override whether stall/recovery transitions wake the parent session. Defaults to the inverse of `auto-exit`: autonomous agents (`auto-exit: true`) are non-interactive and get stall pings; agents without `auto-exit` are interactive and stay quiet. Explicit values take precedence. |
 | `cwd`         | string  | Default working directory (absolute or relative to project root)                                                                                                                                                                                                            |
 | `disable-model-invocation` | boolean | Hide this agent from discovery surfaces like `subagents_list`. The agent still remains directly invokable by explicit name via `subagent({ agent: "name", ... })`. |
@@ -332,13 +337,16 @@ session-mode: lineage-only
 
 ### `auto-exit`
 
-When set to `true`, the agent session shuts down automatically as soon as the agent finishes its turn — no explicit `subagent_done` call is needed.
+When set to `true`, a normally completed turn closes after the agent's final message — no explicit `subagent_done` call is needed. An aborted turn remains open unless it contains permanent provider-failure evidence and has not been taken over.
 
 **Behavior:**
 
-- The session closes after the agent's final message (on the `agent_end` event)
-- If the user sends **any input** before the agent finishes, auto-exit is permanently disabled for that session — the user takes over interactively
-- The modeHint injected into the agent's task is adjusted accordingly: autonomous agents see "Complete your task autonomously." rather than instructions to call `subagent_done`
+- A normally completed turn closes after the agent's final message (on the `agent_end` event).
+- On an autonomous child's initial input, the lifecycle first checks `modelRegistry.hasConfiguredAuth(model)`. Missing local authentication is intercepted before credential resolution or provider invocation; configured authentication is then resolved so resolver failures use the same terminal error path. Successful resolved values are not copied into launch artifacts, error sidecars, diagnostics, or session artifacts.
+- Rejected credentials and unknown, unavailable, inaccessible, or access-denied models are detected from structured terminal assistant errors. These permanent credential/model failures close the autonomous child and surface the concrete error to its parent. Credential-bearing values in those errors are redacted before sidecar persistence, fallback diagnostics, or parent delivery while provider, model, and HTTP status context remains visible.
+- A plain Escape or other manual abort without permanent provider-failure evidence leaves the child open for inspection or another prompt.
+- Input after the agent starts marks the current run as a user takeover. Takeover keeps an aborted turn open even if it contains otherwise-permanent failure evidence. A normally completed taken-over turn still closes automatically.
+- The modeHint injected into the agent's task is adjusted accordingly: autonomous agents see "Complete your task autonomously." rather than instructions to call `subagent_done`.
 
 **When to use:**
 
@@ -410,7 +418,7 @@ deny-tools: subagent
 
 | Agent      | `spawning`  | Rationale                                    |
 | ---------- | ----------- | -------------------------------------------- |
-| planner    | _(default)_ | Legitimately spawns scouts for investigation |
+| planner    | *(default)* | Legitimately spawns scouts for investigation |
 | worker     | `false`     | Should implement tasks, not delegate         |
 | researcher | `false`     | Should research, not spawn                   |
 | reviewer   | `false`     | Should review, not spawn                     |
@@ -520,7 +528,19 @@ MIT
 
 If your project pins [jjuraszek/pi-subagents](https://github.com/jjuraszek/pi-subagents) (published as `pi-cohort`) as a team contract, you can't install this package normally — both register a tool named `subagent` and pi will error on the collision.
 
-Instead, use the bridge extension in `pi-extension/cohort-bridge.ts`. It intercepts pi-cohort's `subagent` tool calls and re-dispatches them through this package's cmux machinery — single and parallel calls spawn in panes (one per child) and steer results back, honoring per-call/per-task `output` files; chain calls, and calls using semantics a pane can't reproduce (worktree, acceptance, fork context, structured output, skill/reads overrides), fall through to pi-cohort's implementation unchanged.
+Instead, use the bridge extension in `pi-extension/cohort-bridge.ts`. It intercepts pi-cohort's `subagent` tool calls and re-dispatches them through this package's mux machinery. Single and parallel calls spawn in panes (one per child) and steer results back, including forked context, skill overrides, acceptance verification and reviewer gates, structured output, reads/progress instructions, and per-call/per-task output files. Parallel `worktree: true` calls create one isolated git worktree per child, run each pane in its isolated cwd, copy requested output files into the run's durable artifact tree, collect patch artifacts, and then clean up the temporary worktrees. Sequential chains, static parallel chain groups, and dynamic fanout groups also execute through panes, preserving `{task}`, `{previous}`, `{chain_dir}`, named `{outputs.name}` templates, and dynamic item aliases. Dynamic fanout consumes prior structured named output through JSON Pointer, assigns stable child IDs from `expand.key`, launches with bounded concurrency and fail-fast behavior, and collects results in input order under `collect.as`. Calls with `clarify: true` use pi-cohort's clarification UI in the parent, then dispatch the confirmed request through panes. Unknown agents, unresolved skills, malformed current requests, invalid output settings, and invalid acceptance reviewers are rejected with an `Invalid pane subagent request` blocking error before any pane launches. Native fallback is limited to an unavailable mux, management/non-dispatch actions, and genuinely future orchestration fields the bridge does not yet recognize; labeled dispatch fallbacks default to `async: true` unless the caller explicitly requests `async: false`.
+
+Pane children receive already-resolved parent credentials through a one-shot FIFO
+inside a private temporary directory. The FIFO is mode `0600`, its payload is
+limited to the bridge's credential allowlist, and the child reads it with a
+bounded timeout and removes it before invoking `pi`; persisted launch artifacts
+contain only the random FIFO path. Bridge-owned outcome diagnostics redact the
+exact handed-off values. The bridge removes the temporary directory after
+success or failure. When
+the parent has no resolved credential to hand off, canonical presets fall back
+to their `pi-anthropic`, `pi-balanced`, or `pi-local` fish launcher.
+
+When the primary model or any attempted fallback has an eligible permanent model or authentication failure, the bridge advances only through that persona's explicitly configured `fallbackModels`, in configured order. Every attempt gets a fresh pane and session, and the failed pane closes before the next attempt starts. If all candidates fail, the parent receives ordered per-attempt diagnostics and the final concrete error. Credential-bearing values from sidecar or legacy/raw child `errorMessage` strings are redacted before diagnostics and parent delivery; raw provider error objects/fields are not included. Unrelated task, tool, extension-startup, and manual-abort failures do not advance the model fallback sequence. In nested child sessions, `PI_SUBAGENT_DEPTH` suppresses only the legacy interactive-subagents extension registration that would collide with pi-cohort's `subagent` tool; normal discovery and loading of unrelated extensions remains enabled.
 
 **Setup:**
 
@@ -548,6 +568,7 @@ Or manually:
    ln -s "$PKG/subagents/cmux.ts"            "$EXT/subagents/cmux.ts"
    ln -s "$PKG/subagents/session.ts"         "$EXT/subagents/session.ts"
    ln -s "$PKG/subagents/activity.ts"        "$EXT/subagents/activity.ts"
+   ln -s "$PKG/subagents/model-failure.ts"   "$EXT/subagents/model-failure.ts"
    ln -s "$PKG/subagents/subagent-done.ts"   "$EXT/subagents/subagent-done.ts"
    ln -s "$PKG/subagents/persona-resolve.ts" "$EXT/subagents/persona-resolve.ts"
    ln -s "$PKG/subagents/output.ts"          "$EXT/subagents/output.ts"
@@ -560,39 +581,15 @@ Or manually:
    > sidesteps the collision.
 
 4. Set the mux backend in your shell (e.g. `~/.config/fish/conf.d/pi-subagents.fish`):
+
    ```fish
    set -gx PI_SUBAGENT_MUX cmux
    ```
+
 5. `/reload` in pi.
 
-Single and parallel `subagent(...)` calls will now open cmux panes and steer results back asynchronously. Chain calls (and unsupported shapes) fall through to pi-cohort's implementation unchanged.
+Single, parallel, sequential-chain, static-parallel-chain, dynamic-fanout-chain, and clarified `subagent(...)` calls now open mux panes and steer results back asynchronously. Native-only exceptions are reported in the immediate tool result instead of silently running inline.
+
+`subagent({ action: "status" })` falls through to pi-cohort's native executor (only dispatch calls are blocked), and the bridge appends a `cohort-bridge children (this session)` section to that result listing the panes this session launched — otherwise cmux children are invisible to pi-cohort's async-run registry and only `intercom list` would show them. Children are tracked in-process (added at pane launch, removed on exit) and each line reports the intercom session name, label, elapsed time, and current activity from the child's activity snapshot. A targeted `{ action: "status", id }` lookup is left untouched.
 
 The bridge reflects its state in pi's footer status line rather than logging on every boot: `● cohort-bridge: cmux` when active, `● cohort-bridge: mux unavailable` when `PI_SUBAGENT_MUX` is set but no mux is running, and nothing when no mux was requested. It only writes to stderr in that misconfiguration case (mux wanted but unavailable) — never on the happy path.
-
-### Preset launchers
-
-For every supported pane backend, the bridge reserves three canonical agent
-directory paths under the current user's home and maps each one to a
-corresponding user-defined Fish function:
-
-- `~/.pi/agent.non-zdr` uses `pi-non-zdr`
-- `~/.pi/agent.zdr` uses `pi-zdr`
-- `~/.pi/agent.local` uses `pi-local`
-
-The bridge compares canonical paths, so a symlink that resolves to one of these
-reserved paths uses the same mapping. The corresponding function must be
-available to `fish -lc`; the bridge invokes it with the pi arguments passed
-positionally. For this preset handoff, the bridge serializes the launcher
-invocation and positional arguments, never resolved credential values, into the
-generated `launch.sh` artifact. Launcher implementation and credential handling
-are user-managed and outside this package.
-
-Any agent directory that does not canonically match a reserved path, including
-a custom directory with the same basename, uses raw `pi` with
-`PI_CODING_AGENT_DIR` set explicitly. If Fish cannot start or the mapped
-function is unavailable, the reserved-path launch fails loudly rather than
-falling back to raw `pi`.
-
-Fish is required to run the preset-launch smoke tests in
-`test/cohort-bridge-pane-launch.test.ts`; the package's `npm test` command
-includes this test file.

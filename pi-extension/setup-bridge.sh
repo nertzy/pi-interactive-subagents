@@ -35,9 +35,17 @@ symlink "$PKG/cohort-bridge.ts"              "$EXT/cohort-bridge.ts"
 symlink "$PKG/subagents/cmux.ts"            "$EXT/subagents/cmux.ts"
 symlink "$PKG/subagents/session.ts"         "$EXT/subagents/session.ts"
 symlink "$PKG/subagents/activity.ts"        "$EXT/subagents/activity.ts"
+symlink "$PKG/subagents/model-failure.ts"   "$EXT/subagents/model-failure.ts"
 symlink "$PKG/subagents/subagent-done.ts"   "$EXT/subagents/subagent-done.ts"
 symlink "$PKG/subagents/persona-resolve.ts" "$EXT/subagents/persona-resolve.ts"
 symlink "$PKG/subagents/output.ts"          "$EXT/subagents/output.ts"
+
+for dependency in activity.ts model-failure.ts subagent-done.ts; do
+  if [ ! -e "$EXT/subagents/$dependency" ]; then
+    echo "ERROR: missing child extension dependency: $EXT/subagents/$dependency" >&2
+    exit 1
+  fi
+done
 
 echo ""
 echo "Done. Reload pi with /reload."

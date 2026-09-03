@@ -17,13 +17,17 @@ import { fileURLToPath } from "node:url";
 // instead of the package root and fail to find config.json.example.
 const MODULE_DIR = dirname(realpathSync(fileURLToPath(import.meta.url)));
 import { createSubagentActivityRecorder } from "./activity.ts";
+import {
+  isPermanentModelOrAuthFailure,
+  redactCredentialValues,
+} from "./model-failure.ts";
 
 export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
   return agentStarted;
 }
 
 export function shouldAutoExitOnAgentEnd(
-  _userTookOver: boolean,
+  userTookOver: boolean,
   messages: any[] | undefined,
 ): boolean {
   // Manual input should not strand an auto-exit subagent. If the latest agent
@@ -38,7 +42,8 @@ export function shouldAutoExitOnAgentEnd(
     for (let i = messages.length - 1; i >= 0; i--) {
       const msg = messages[i];
       if (msg?.role === "assistant") {
-        return msg.stopReason !== "aborted";
+        if (msg.stopReason !== "aborted") return true;
+        return !userTookOver && isPermanentModelOrAuthFailure(msg);
       }
     }
   }
@@ -58,7 +63,7 @@ export interface SubagentErrorInfo {
  * failure instead of silently treating the run as completed.
  *
  * Returns `null` when the latest assistant turn completed normally or was
- * aborted by the user (handled separately by shouldAutoExitOnAgentEnd).
+ * aborted without evidence of a permanent model/authentication failure.
  */
 export function findLatestAssistantError(
   messages: any[] | undefined,
@@ -67,7 +72,8 @@ export function findLatestAssistantError(
   for (let i = messages.length - 1; i >= 0; i--) {
     const msg = messages[i];
     if (msg?.role !== "assistant") continue;
-    if (msg.stopReason !== "error") return null;
+    const permanentAbort = msg.stopReason === "aborted" && isPermanentModelOrAuthFailure(msg);
+    if (msg.stopReason !== "error" && !permanentAbort) return null;
     const raw = typeof msg.errorMessage === "string" ? msg.errorMessage.trim() : "";
     return {
       errorMessage: raw || "Subagent agent loop ended with stopReason=error (no errorMessage field).",
@@ -213,6 +219,23 @@ export function createSubagentDoneExtension(
   let userTookOver = false;
   let agentStarted = false;
 
+  function writeErrorSidecar(errorMessage: string): void {
+    const sessionFile = process.env.PI_SUBAGENT_SESSION;
+    if (!sessionFile) return;
+    try {
+      writeFileSync(
+        `${sessionFile}.exit`,
+        JSON.stringify({
+          type: "error",
+          errorMessage: redactCredentialValues(errorMessage),
+          stopReason: "error",
+        }),
+      );
+    } catch {
+      // Best effort — the watcher may still recover an error from the session.
+    }
+  }
+
   // Show widget + status bar on session start
   pi.on("session_start", (_event, ctx) => {
     recorder.sessionStart();
@@ -229,15 +252,38 @@ export function createSubagentDoneExtension(
     renderWidget(ctx, null);
   });
 
-  pi.on("input", () => {
+  pi.on("input", async (_event, ctx) => {
     recorder.input();
     // Ignore the initial task message that starts an autonomous subagent.
     // Only inputs after the first agent run has started count as user takeover.
-    if (!shouldMarkUserTookOver(agentStarted)) return;
-    userTookOver = true;
+    if (shouldMarkUserTookOver(agentStarted)) {
+      userTookOver = true;
+      return { action: "continue" as const };
+    }
+
+    if (!autoExit || userTookOver || !ctx.model) {
+      return { action: "continue" as const };
+    }
+
+    if (!ctx.modelRegistry.hasConfiguredAuth(ctx.model)) {
+      const provider = ctx.model.provider || "selected provider";
+      writeErrorSidecar(`No API key found for provider "${provider}".`);
+      recorder.agentEndDone();
+      ctx.shutdown();
+      return { action: "handled" as const };
+    }
+
+    const auth = await ctx.modelRegistry.getApiKeyAndHeaders(ctx.model);
+    if (auth.ok) return { action: "continue" as const };
+
+    const errorMessage = auth.error;
+    writeErrorSidecar(errorMessage);
+    recorder.agentEndDone();
+    ctx.shutdown();
+    return { action: "handled" as const };
   });
 
-  pi.on("before_agent_start", () => {
+  pi.on("before_agent_start", (_event, _ctx) => {
     recorder.beforeAgentStart();
   });
 
@@ -257,22 +303,7 @@ export function createSubagentDoneExtension(
       // Without this the parent would only see exit code 0 and a stale
       // assistant message, mistaking the crash for a successful completion.
       const errorInfo = findLatestAssistantError(messages);
-      const sessionFile = process.env.PI_SUBAGENT_SESSION;
-      if (errorInfo && sessionFile) {
-        try {
-          writeFileSync(
-            `${sessionFile}.exit`,
-            JSON.stringify({
-              type: "error",
-              errorMessage: errorInfo.errorMessage,
-              stopReason: errorInfo.stopReason,
-            }),
-          );
-        } catch {
-          // Best effort — even without the sidecar, watcher's session-file
-          // fallback can still recover the errorMessage.
-        }
-      }
+      if (errorInfo) writeErrorSidecar(errorInfo.errorMessage);
 
       recorder.agentEndDone();
       ctx.shutdown();

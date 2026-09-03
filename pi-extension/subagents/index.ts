@@ -1357,7 +1357,18 @@ async function watchSubagent(
   }
 }
 
+export function shouldRegisterLegacySubagentsExtension(depth: string | undefined): boolean {
+  if (depth === undefined || depth === "") return true;
+  const parsedDepth = Number(depth);
+  return !Number.isFinite(parsedDepth) || parsedDepth <= 0;
+}
+
 export default function subagentsExtension(pi: ExtensionAPI) {
+  // Nested children load their own lifecycle extension. Avoid registering any
+  // part of this legacy parent extension there, while leaving pi's normal
+  // discovery of all unrelated extensions untouched.
+  if (!shouldRegisterLegacySubagentsExtension(process.env.PI_SUBAGENT_DEPTH)) return;
+
   // Capture the UI context for widget updates
   pi.on("session_start", (_event, ctx) => {
     latestCtx = ctx;

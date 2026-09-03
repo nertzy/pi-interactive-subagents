@@ -20,8 +20,8 @@
  * e.g. delegate/scout/worker) ARE resolved here: they are plain frontmatter
  * markdown in `<pi-subagents>/agents/`, scanned at lowest precedence so
  * `.agents`/`.pi/agents` customs with the same name shadow them -- matching
- * pi-subagents' own mergeAgentsForScope order. Only a genuinely unknown
- * agent name should make the caller fall through to Jacek's native executor.
+ * pi-subagents' own mergeAgentsForScope order. Unknown names remain unresolved
+ * so the dispatch boundary can reject them before any backend launches.
  */
 
 import * as fs from "node:fs";
@@ -40,13 +40,17 @@ export function applyThinkingSuffix(model: string | undefined, thinking: string 
 export interface ResolvedPersona {
   filePath: string;
   model?: string;
+  fallbackModels?: string[];
   thinking?: string;
   systemPromptMode: "append" | "replace";
   inheritProjectContext: boolean;
   inheritSkills: boolean;
+  defaultContext?: "fresh" | "fork";
+  disabled?: boolean;
   systemPrompt: string;
   tools?: string[];
   skills?: string[];
+  completionGuard?: boolean;
 }
 
 function parseFrontmatter(content: string): { frontmatter: Record<string, string>; body: string } {
@@ -195,12 +199,14 @@ interface PersonaFile {
   filePath: string;
   frontmatter: Record<string, string>;
   body: string;
+  builtin: boolean;
 }
 
-// Scans `.agents`/`.pi/agents` only (no builtins). Returns the highest-
+// Scans builtin and custom persona directories. Returns the highest-
 // precedence match for `runtimeName`, or undefined if not found there.
 function findPersonaFile(runtimeName: string, cwd: string): PersonaFile | undefined {
   let found: PersonaFile | undefined;
+  const builtinDir = findSubagentsBuiltinAgentsDir(cwd);
   for (const dir of personaSearchDirs(cwd)) {
     let entries: fs.Dirent[];
     try {
@@ -222,7 +228,7 @@ function findPersonaFile(runtimeName: string, cwd: string): PersonaFile | undefi
       if (!frontmatter.name || !frontmatter.description) continue;
       const packageName = normalizePackageName(frontmatter.package);
       if (buildRuntimeName(frontmatter.name, packageName) === runtimeName) {
-        found = { filePath, frontmatter, body };
+        found = { filePath, frontmatter, body, builtin: builtinDir !== undefined && resolveRealPath(dir) === resolveRealPath(builtinDir) };
       }
     }
   }
@@ -230,16 +236,20 @@ function findPersonaFile(runtimeName: string, cwd: string): PersonaFile | undefi
 }
 
 interface AgentOverride {
-  model?: string;
-  thinking?: string;
+  model?: string | false;
+  fallbackModels?: string[] | false;
+  thinking?: string | false;
   systemPromptMode?: "append" | "replace";
   inheritProjectContext?: boolean;
   inheritSkills?: boolean;
+  defaultContext?: "fresh" | "fork" | false;
+  disabled?: boolean;
   systemPrompt?: string;
   skills?: string[] | false;
   tools?: string[] | false;
   toolsPrepend?: string[];
   toolsAppend?: string[];
+  completionGuard?: boolean;
 }
 
 function readJsonBestEffort(filePath: string): unknown {
@@ -262,63 +272,98 @@ function readAgentOverride(settingsPath: string, localName: string): AgentOverri
 }
 
 // Project override wins over user override outright (whole-object, not
-// merged across scopes -- matches pi-subagents' override precedence). Within
-// the chosen scope, each field only fills what the frontmatter left unset.
-function resolveAgentOverride(localName: string, cwd: string): AgentOverride | undefined {
-  const projectRoot = findNearestProjectRoot(cwd);
-  if (projectRoot) {
-    const projectOverride = readAgentOverride(path.join(projectRoot, ".pi", "settings.json"), localName);
-    if (projectOverride) return projectOverride;
+// merged across scopes), matching pi-cohort. Project levels are considered
+// farthest-first, with the nearest definition replacing the whole entry.
+function resolveAgentOverride(localName: string, cwd: string): { override?: AgentOverride; disableBuiltins?: boolean } {
+  let projectOverride: AgentOverride | undefined;
+  let projectDisableBuiltins: boolean | undefined;
+  for (const level of enumerateProjectLevels(cwd)) {
+    const settings = readJsonBestEffort(path.join(level, ".pi", "settings.json"));
+    if (!settings || typeof settings !== "object") continue;
+    const subagents = (settings as Record<string, unknown>).subagents;
+    if (!subagents || typeof subagents !== "object") continue;
+    const value = subagents as Record<string, unknown>;
+    if (typeof value.disableBuiltins === "boolean") projectDisableBuiltins = value.disableBuiltins;
+    const entry = (value.agentOverrides as Record<string, unknown> | undefined)?.[localName];
+    if (entry && typeof entry === "object" && !Array.isArray(entry)) projectOverride = entry as AgentOverride;
   }
-  return readAgentOverride(path.join(getAgentDir(), "settings.json"), localName);
+  if (projectOverride) return { override: projectOverride };
+  if (projectDisableBuiltins === true) return { disableBuiltins: true };
+
+  const userSettingsPath = path.join(getAgentDir(), "settings.json");
+  const userSettings = readJsonBestEffort(userSettingsPath);
+  const userSubagents = userSettings && typeof userSettings === "object"
+    ? (userSettings as Record<string, any>).subagents
+    : undefined;
+  return {
+    override: readAgentOverride(userSettingsPath, localName),
+    disableBuiltins: projectDisableBuiltins === false
+      ? false
+      : typeof userSubagents?.disableBuiltins === "boolean" ? userSubagents.disableBuiltins : undefined,
+  };
+}
+
+function parseBoolean(value: string | undefined): boolean | undefined {
+  return value === "true" ? true : value === "false" ? false : undefined;
+}
+
+function parseList(value: string | undefined): string[] | undefined {
+  const items = value?.split(",").map((item) => item.trim()).filter(Boolean);
+  return items?.length ? items : undefined;
+}
+
+function composeTools(base: string[], prepend?: string[], append?: string[]): string[] | undefined {
+  const result = [...new Set([...(prepend ?? []), ...base, ...(append ?? [])])];
+  return result.length ? result : undefined;
 }
 
 export function resolvePersona(runtimeName: string, cwd: string): ResolvedPersona | undefined {
   const persona = findPersonaFile(runtimeName, cwd);
   if (!persona) return undefined;
   const { frontmatter, body } = persona;
-  const override = resolveAgentOverride(frontmatter.name, cwd);
+  const settings = resolveAgentOverride(frontmatter.name, cwd);
+  const override = settings.override;
+  const frontmatterTools = parseList(frontmatter.tools);
+  const frontmatterSkills = parseList(frontmatter.skill || frontmatter.skills);
+  const builtin = persona.builtin;
 
-  const tools = frontmatter.tools?.split(",").map((t) => t.trim()).filter(Boolean);
-  const skillStr = frontmatter.skill || frontmatter.skills;
-  const skills = skillStr?.split(",").map((s) => s.trim()).filter(Boolean);
-
-  let resolvedTools = tools && tools.length > 0 ? tools : undefined;
-  if (resolvedTools === undefined && (override?.tools !== undefined || override?.toolsPrepend || override?.toolsAppend)) {
-    const base = override?.tools === false ? [] : override?.tools ?? [];
-    const seen = new Set<string>();
-    const merged = [...(override?.toolsPrepend ?? []), ...base, ...(override?.toolsAppend ?? [])].filter((t) =>
-      seen.has(t) ? false : (seen.add(t), true),
-    );
-    resolvedTools = merged.length > 0 ? merged : undefined;
-  }
-
-  const resolvedSkills =
-    skills && skills.length > 0 ? skills : override?.skills === false ? undefined : (override?.skills as string[] | undefined);
+  // Builtins are replacement-configurable. Custom personas retain their
+  // frontmatter and only use settings to fill unset fields; prepend/append
+  // still compose around custom tools. This mirrors pi-cohort agents.ts.
+  const replace = <T>(base: T | undefined, value: T | false | undefined): T | undefined =>
+    builtin && value !== undefined ? (value === false ? undefined : value) : base === undefined && value !== false ? value : base;
+  const toolsReplacementApplies = builtin
+    ? override?.tools !== undefined
+    : frontmatterTools === undefined && override?.tools !== undefined;
+  const effectiveTools = toolsReplacementApplies
+    ? (override?.tools === false ? [] : override?.tools ?? [])
+    : (frontmatterTools ?? []);
+  const tools = override?.tools !== undefined || override?.toolsPrepend || override?.toolsAppend
+    ? composeTools(effectiveTools, override?.toolsPrepend, override?.toolsAppend)
+    : frontmatterTools;
+  const skills = replace(frontmatterSkills, override?.skills);
+  const frontmatterContext = frontmatter.defaultContext === "fresh" || frontmatter.defaultContext === "fork"
+    ? frontmatter.defaultContext
+    : undefined;
 
   return {
     filePath: persona.filePath,
-    model: frontmatter.model ?? override?.model,
-    thinking: frontmatter.thinking ?? override?.thinking,
-    systemPromptMode:
-      frontmatter.systemPromptMode === "append" || frontmatter.systemPromptMode === "replace"
-        ? frontmatter.systemPromptMode
-        : (override?.systemPromptMode ?? "replace"),
-    inheritProjectContext:
-      frontmatter.inheritProjectContext === "true"
-        ? true
-        : frontmatter.inheritProjectContext === "false"
-          ? false
-          : (override?.inheritProjectContext ?? false),
-    inheritSkills:
-      frontmatter.inheritSkills === "true"
-        ? true
-        : frontmatter.inheritSkills === "false"
-          ? false
-          : (override?.inheritSkills ?? false),
-    systemPrompt: body || override?.systemPrompt || "",
-    tools: resolvedTools,
-    skills: resolvedSkills,
+    model: replace(frontmatter.model, override?.model),
+    fallbackModels: replace(parseList(frontmatter.fallbackModels), override?.fallbackModels),
+    thinking: replace(frontmatter.thinking, override?.thinking),
+    systemPromptMode: replace(
+      frontmatter.systemPromptMode === "append" || frontmatter.systemPromptMode === "replace" ? frontmatter.systemPromptMode : undefined,
+      override?.systemPromptMode,
+    ) ?? (frontmatter.name === "delegate" ? "append" : "replace"),
+    inheritProjectContext: replace(parseBoolean(frontmatter.inheritProjectContext), override?.inheritProjectContext)
+      ?? frontmatter.name === "delegate",
+    inheritSkills: replace(parseBoolean(frontmatter.inheritSkills), override?.inheritSkills) ?? false,
+    defaultContext: replace(frontmatterContext, override?.defaultContext),
+    disabled: builtin ? (override?.disabled ?? settings.disableBuiltins) : replace(parseBoolean(frontmatter.disabled), override?.disabled),
+    systemPrompt: replace(body || undefined, override?.systemPrompt) ?? "",
+    tools,
+    skills,
+    completionGuard: replace(parseBoolean(frontmatter.completionGuard), override?.completionGuard),
   };
 }
 
