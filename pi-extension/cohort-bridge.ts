@@ -1048,8 +1048,7 @@ async function loadCohortClarifyRuntime(cwd: string): Promise<CohortClarifyRunti
   const runtimeExtension = findSubagentsRuntimeExtension(cwd);
   if (!runtimeExtension) throw new Error("pi-cohort clarification UI modules were not found");
   const root = resolve(dirname(runtimeExtension), "../../..");
-  const { createJiti } = await import(join(root, "../jiti/lib/jiti.mjs"));
-  const jiti = createJiti(import.meta.url, { interopDefault: true });
+  const jiti = await createCohortJiti(root);
   const [clarify, settings, skills, models] = await Promise.all([
     jiti.import(join(root, "src/runs/foreground/chain-clarify.ts")),
     jiti.import(join(root, "src/shared/settings.ts")),
@@ -1157,12 +1156,23 @@ const ACCEPTANCE_REVIEW_SCHEMA = {
   additionalProperties: false,
 };
 
+// pi-cohort declares typebox as a host-provided peer, so a bare jiti cannot
+// resolve it. Under pi, alias it to the host's copies exactly as pi's
+// extension loader does; under plain Node there is no host pi, so resolve it
+// from pi-cohort's own install.
+async function createCohortJiti(root: string): Promise<any> {
+  const { createJiti } = await import(join(root, "../jiti/lib/jiti.mjs"));
+  const bootstrap = createJiti(import.meta.url, { interopDefault: true });
+  const { resolveHostModuleAliases } = await bootstrap.import(join(root, "src/runs/shared/jiti-cli.ts")) as any;
+  const { resolvePiPackageRoot } = await bootstrap.import(join(root, "src/runs/shared/pi-spawn.ts")) as any;
+  return createJiti(import.meta.url, { interopDefault: true, alias: resolveHostModuleAliases(resolvePiPackageRoot() ?? root) });
+}
+
 async function loadInstalledCohortModules(cwd: string, paths: string[]): Promise<any[]> {
   const runtimeExtension = findSubagentsRuntimeExtension(cwd);
   if (!runtimeExtension) throw new Error("pi-cohort runtime modules were not found");
   const root = resolve(dirname(runtimeExtension), "../../..");
-  const { createJiti } = await import(join(root, "../jiti/lib/jiti.mjs"));
-  const jiti = createJiti(import.meta.url, { interopDefault: true });
+  const jiti = await createCohortJiti(root);
   return Promise.all(paths.map((path) => jiti.import(join(root, path))));
 }
 
