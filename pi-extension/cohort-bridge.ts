@@ -1164,8 +1164,17 @@ async function createCohortJiti(root: string): Promise<any> {
   const { createJiti } = await import(join(root, "../jiti/lib/jiti.mjs"));
   const bootstrap = createJiti(import.meta.url, { interopDefault: true });
   const { resolveHostModuleAliases } = await bootstrap.import(join(root, "src/runs/shared/jiti-cli.ts")) as any;
-  const { resolvePiPackageRoot } = await bootstrap.import(join(root, "src/runs/shared/pi-spawn.ts")) as any;
-  return createJiti(import.meta.url, { interopDefault: true, alias: resolveHostModuleAliases(resolvePiPackageRoot() ?? root) });
+  const { capturePiRuntime, PiRuntimeLaunchError } = await bootstrap.import(join(root, "src/runs/shared/pi-spawn.ts")) as any;
+  return createJiti(import.meta.url, { interopDefault: true, alias: resolveHostModuleAliases(hostPiPackageRoot(capturePiRuntime, PiRuntimeLaunchError) ?? root) });
+}
+
+function hostPiPackageRoot(capturePiRuntime: () => { piPackageRoot: string }, PiRuntimeLaunchError: new (...args: any[]) => Error): string | undefined {
+  try {
+    return capturePiRuntime().piPackageRoot;
+  } catch (error) {
+    if (error instanceof PiRuntimeLaunchError) return undefined;
+    throw error;
+  }
 }
 
 async function loadInstalledCohortModules(cwd: string, paths: string[]): Promise<any[]> {
